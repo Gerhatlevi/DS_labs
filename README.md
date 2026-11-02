@@ -9,4 +9,3 @@ lab details can be found in a README.md under each of the respective lab folders
 Intro to go lab that introduces basic socket programming in go. This implements an HTTP server that handles
 connections by spawning child processes. Then a pub-sub broker is added to handle subscribing and publishing
 to different topics.
-
