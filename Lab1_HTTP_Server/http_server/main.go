@@ -12,7 +12,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 )
+
+var rwMutex = &sync.RWMutex{}
 
 func extensionToContentType() map[string]string {
 	return map[string]string{
@@ -59,17 +62,12 @@ func writeFile(name string, f multipart.File) (error) {
 	r := bufio.NewReader(f)
 
 	// create the output file if not exists
-	fo, err := os.Create(name)
+	out, err := os.Create(name)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := fo.Close(); err != nil {
-			panic(err)
-		}
-	}()
 
-	w := bufio.NewWriter(fo)
+	w := bufio.NewWriter(out)
 
 	// copy over chunks of 1024 bytes from the input multipart file
 	// to the newly created file
@@ -127,6 +125,8 @@ func handleConn(conn net.Conn) {
 	// only handle this request if it is a supported file extension
 	if ok {
 		if req.Method == "POST" {
+			rwMutex.Lock()
+			defer rwMutex.Unlock()
 			// Collect the file that was sent in this request and write to disk
 			file, _, err := req.FormFile("file")
 			if err != nil {
@@ -139,6 +139,8 @@ func handleConn(conn net.Conn) {
 			}
 			res.StatusCode = http.StatusCreated
 		} else if req.Method == "GET" {
+			rwMutex.RLock()
+			defer rwMutex.RUnlock()
 			// Read the requested file from disk and serve the file
 			// serve a 404 if the file cannot be found
 			fd, err := readFile(fileName)
@@ -162,6 +164,7 @@ func handleConn(conn net.Conn) {
 	// properly close the connection once the file has been serviced
 	conn.Close()
 }
+
 
 func main() {
 	// NOTE: this should also take first arg if -port is not specified
