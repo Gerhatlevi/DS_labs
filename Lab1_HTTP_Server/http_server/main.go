@@ -6,10 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 )
 
@@ -29,7 +30,66 @@ func extensionToContentType() map[string]string {
 // used to provide a Close() function to the bytes buffer object which does
 // not provide such a function
 func bodyWrapper(s string) io.ReadCloser {
-	return ioutil.NopCloser(bytes.NewBuffer([]byte(s)))
+	return io.NopCloser(bytes.NewBuffer([]byte(s)))
+}
+
+// setHeader is a helper function that abstracts setting the header for the
+// http.Request struct to ensure the CanonicalHeaderKey is called properly
+func setHeader(res http.Response, s string, v string) {
+	res.Header.Set(http.CanonicalHeaderKey(s), v)
+}
+
+// readFile takes care of reading a file and passing back the read buffer
+// to stream back to the user for a GET request
+func readFile(f string) (io.Reader, error) {
+	file, err := os.Open(f)
+	if err != nil {
+		return nil, err
+	}
+
+	// create the read buffer to stream to the user
+	r := bufio.NewReader(file)
+	return r, nil
+}
+
+// writeFile takes care of writing a stream that came from the user POST
+// request and writing to the desired file name. Heavily inspired from
+// https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-a-file-using-go
+func writeFile(name string, f multipart.File) (error) {
+	r := bufio.NewReader(f)
+
+	// create the output file if not exists
+	fo, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := fo.Close(); err != nil {
+			panic(err)
+		}
+	}()
+
+	w := bufio.NewWriter(fo)
+
+	// copy over chunks of 1024 bytes from the input multipart file
+	// to the newly created file
+	buf := make([]byte, 1024)
+	for {
+		n, err := r.Read(buf)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n == 0 {
+			break
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return err
+		}
+	}
+	if err = w.Flush(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // handleConn is the main HTTP handler for the server that involves
@@ -56,22 +116,39 @@ func handleConn(conn net.Conn) {
 
 	// get the extension of the requested file for lookup for Content-type
 	uri := req.RequestURI
-	uriList := strings.Split(uri, ".")
-	ext := uriList[len(uriList)-1]
+	// split on / so that we don't allow directory traversal
+	// we will only take the last value if multiple / are used in the uri
+	fileList := strings.Split(uri, "/")
+	fileName := fileList[len(fileList)-1]
+	extList := strings.Split(fileName, ".")
+	ext := extList[len(extList)-1]
 	contentType, ok := extensionToContentType()[ext]
-	fmt.Println("got URI", uri)
 
 	// only handle this request if it is a supported file extension
 	if ok {
 		if req.Method == "POST" {
 			// Collect the file that was sent in this request and write to disk
+			file, _, err := req.FormFile("file")
+			if err != nil {
+				res.StatusCode = http.StatusBadRequest
+			}
+			err = writeFile(fileName, file)
+			if err != nil {
+				res.StatusCode = http.StatusBadRequest
+				res.Body = bodyWrapper(fmt.Sprintf("", err))
+			}
 			res.StatusCode = http.StatusCreated
 		} else if req.Method == "GET" {
 			// Read the requested file from disk and serve the file
 			// serve a 404 if the file cannot be found
-			res.StatusCode = http.StatusOK
-			res.Header.Set(http.CanonicalHeaderKey("Content-type"), contentType)
-			res.Body = bodyWrapper("henlo\n")
+			fd, err := readFile(fileName)
+			if err != nil {
+				res.StatusCode = http.StatusNotFound
+			} else {
+				res.StatusCode = http.StatusOK
+				setHeader(res, "Content-type", contentType)
+				res.Body = io.NopCloser(fd)
+			}
 		} else {
 			res.StatusCode = http.StatusNotImplemented
 		}
