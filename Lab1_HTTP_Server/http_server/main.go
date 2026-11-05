@@ -15,16 +15,32 @@ import (
 	"sync"
 )
 
+const (
+	maxConCurrent = 10
+)
+
+// https://go-cookbook.com/snippets/concurrency/semaphores
+type Semaphore struct {
+	Channel chan struct{}
+}
+
+func (s *Semaphore) Acquire() {
+	s.Channel <- struct{}{}
+}
+func (s *Semaphore) Release() {
+	<-s.Channel
+}
+
 var rwMutex = &sync.RWMutex{}
 
 func extensionToContentType() map[string]string {
 	return map[string]string{
 		"html": "text/html",
-		"txt": "text/plain",
-		"gif": "image/gif",
+		"txt":  "text/plain",
+		"gif":  "image/gif",
 		"jpeg": "image/jpeg",
-		"jpg": "image/jpeg",
-		"css": "text/css",
+		"jpg":  "image/jpeg",
+		"css":  "text/css",
 	}
 }
 
@@ -58,7 +74,7 @@ func readFile(f string) (io.Reader, error) {
 // writeFile takes care of writing a stream that came from the user POST
 // request and writing to the desired file name. Heavily inspired from
 // https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-a-file-using-go
-func writeFile(name string, f multipart.File) (error) {
+func writeFile(name string, f multipart.File) error {
 	r := bufio.NewReader(f)
 
 	// create the output file if not exists
@@ -124,7 +140,8 @@ func handleConn(conn net.Conn) {
 
 	// only handle this request if it is a supported file extension
 	if ok {
-		if req.Method == "POST" {
+		switch req.Method {
+		case "POST":
 			rwMutex.Lock()
 			defer rwMutex.Unlock()
 			// Collect the file that was sent in this request and write to disk
@@ -138,7 +155,7 @@ func handleConn(conn net.Conn) {
 				res.Body = bodyWrapper(fmt.Sprintf("", err))
 			}
 			res.StatusCode = http.StatusCreated
-		} else if req.Method == "GET" {
+		case "GET":
 			rwMutex.RLock()
 			defer rwMutex.RUnlock()
 			// Read the requested file from disk and serve the file
@@ -151,7 +168,7 @@ func handleConn(conn net.Conn) {
 				setHeader(res, "Content-type", contentType)
 				res.Body = io.NopCloser(fd)
 			}
-		} else {
+		default:
 			res.StatusCode = http.StatusNotImplemented
 		}
 	} else {
@@ -164,7 +181,6 @@ func handleConn(conn net.Conn) {
 	// properly close the connection once the file has been serviced
 	conn.Close()
 }
-
 
 func main() {
 	// NOTE: this should also take first arg if -port is not specified
@@ -181,8 +197,7 @@ func main() {
 		return
 	}
 
-	//maxConcurrent := 10
-
+	sem := &Semaphore{Channel: make(chan struct{}, maxConCurrent)}
 	// handle incoming connections and spawn off additional goroutines
 	for {
 		conn, err := ln.Accept()
@@ -191,8 +206,13 @@ func main() {
 			continue
 		}
 
+		sem.Acquire()
 		// create a goroutine to handle this connection
 		// NOTE: need to add in a check here to ensure we aren't exceeding maxConcurrent
-		go handleConn(conn)
+		go func(conn net.Conn) {
+			defer sem.Release()
+			handleConn(conn)
+		}(conn)
+
 	}
 }
