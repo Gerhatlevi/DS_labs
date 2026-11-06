@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -18,6 +18,30 @@ import (
 const (
 	maxConCurrent = 10
 )
+
+type LockManager struct {
+	mu    sync.Mutex
+	locks map[string]*sync.RWMutex
+}
+
+func NewLockManager() *LockManager {
+	return &LockManager{locks: make(map[string]*sync.RWMutex)}
+}
+
+func (m *LockManager) ForFile(path string) *sync.RWMutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if lock := m.locks[path]; lock != nil {
+		return lock
+	}
+
+	lock := &sync.RWMutex{}
+	m.locks[path] = lock
+	return lock
+}
+
+var locks = NewLockManager()
 
 // https://go-cookbook.com/snippets/concurrency/semaphores
 type Semaphore struct {
@@ -140,29 +164,35 @@ func handleConn(conn net.Conn) {
 
 	// only handle this request if it is a supported file extension
 	if ok {
+		lock := locks.ForFile(fileName)
 		switch req.Method {
 		case "POST":
-			rwMutex.Lock()
-			defer rwMutex.Unlock()
 			// Collect the file that was sent in this request and write to disk
 			file, _, err := req.FormFile("file")
 			if err != nil {
 				res.StatusCode = http.StatusBadRequest
+				break
 			}
+			defer file.Close()
+			lock.Lock()
 			err = writeFile(fileName, file)
+			lock.Unlock()
 			if err != nil {
 				res.StatusCode = http.StatusBadRequest
 				res.Body = bodyWrapper(fmt.Sprintf("", err))
+				break
 			}
 			res.StatusCode = http.StatusCreated
 		case "GET":
-			rwMutex.RLock()
-			defer rwMutex.RUnlock()
+			lock := locks.ForFile(fileName)
 			// Read the requested file from disk and serve the file
 			// serve a 404 if the file cannot be found
+			lock.RLock()
 			fd, err := readFile(fileName)
+			lock.RUnlock()
 			if err != nil {
 				res.StatusCode = http.StatusNotFound
+				break
 			} else {
 				res.StatusCode = http.StatusOK
 				setHeader(res, "Content-type", contentType)
@@ -184,13 +214,21 @@ func handleConn(conn net.Conn) {
 
 func main() {
 	// NOTE: this should also take first arg if -port is not specified
-	port := flag.Int("port", 5555, "the port number to start the listener on")
+	var port int
 
-	flag.Parse()
+	if len(os.Args) > 1 {
+		var err error
+		port, err = strconv.Atoi(os.Args[1])
+		if err != nil {
+			log.Fatal("usage: http_server <port>")
+		}
+	} else {
+		log.Fatal("usage: http_server <port>")
+	}
 
 	// Start the listener on the specified port
-	fmt.Println("Starting listener on port", *port)
-	portString := fmt.Sprintf(":%d", *port)
+	fmt.Println("Starting listener on port", port)
+	portString := fmt.Sprintf(":%d", port)
 	ln, err := net.Listen("tcp", portString)
 	if err != nil {
 		log.Printf("Failed to start listener: %s", err)
