@@ -167,6 +167,7 @@ func handleConn(conn net.Conn) {
 		lock := locks.ForFile(fileName)
 		switch req.Method {
 		case "POST":
+			lock.Lock()
 			// Collect the file that was sent in this request and write to disk
 			file, _, err := req.FormFile("file")
 			if err != nil {
@@ -174,7 +175,6 @@ func handleConn(conn net.Conn) {
 				break
 			}
 			defer file.Close()
-			lock.Lock()
 			err = writeFile(fileName, file)
 			lock.Unlock()
 			if err != nil {
@@ -184,12 +184,10 @@ func handleConn(conn net.Conn) {
 			}
 			res.StatusCode = http.StatusCreated
 		case "GET":
-			lock := locks.ForFile(fileName)
 			// Read the requested file from disk and serve the file
 			// serve a 404 if the file cannot be found
 			lock.RLock()
 			fd, err := readFile(fileName)
-			lock.RUnlock()
 			if err != nil {
 				res.StatusCode = http.StatusNotFound
 				break
@@ -198,6 +196,7 @@ func handleConn(conn net.Conn) {
 				setHeader(res, "Content-type", contentType)
 				res.Body = io.NopCloser(fd)
 			}
+			lock.RUnlock()
 		default:
 			res.StatusCode = http.StatusNotImplemented
 		}
