@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 const (
 	maxConCurrent = 10
+	outFolder     = "files"
 )
 
 type LockManager struct {
@@ -84,8 +86,9 @@ func setHeader(res http.Response, s string, v string) {
 
 // readFile takes care of reading a file and passing back the read buffer
 // to stream back to the user for a GET request
-func readFile(f string) (io.Reader, error) {
-	file, err := os.Open(f)
+func readFile(name string) (io.Reader, error) {
+	inPath := path.Join(outFolder, name)
+	file, err := os.Open(inPath)
 	if err != nil {
 		return nil, err
 	}
@@ -99,10 +102,11 @@ func readFile(f string) (io.Reader, error) {
 // request and writing to the desired file name. Heavily inspired from
 // https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-a-file-using-go
 func writeFile(name string, f multipart.File) error {
+	outPath := path.Join(outFolder, name)
 	r := bufio.NewReader(f)
 
 	// create the output file if not exists
-	out, err := os.Create(name)
+	out, err := os.Create(outPath)
 	if err != nil {
 		return err
 	}
@@ -223,6 +227,14 @@ func main() {
 		}
 	} else {
 		log.Fatal("usage: http_server <port>")
+	}
+
+	// create a folder to segment the uploaded files
+	if _, err := os.Stat(outFolder); os.IsNotExist(err) {
+		err := os.Mkdir(outFolder, 0755)
+		if err != nil {
+			log.Fatal("Failed to create directory: %s", err)
+		}
 	}
 
 	// Start the listener on the specified port
