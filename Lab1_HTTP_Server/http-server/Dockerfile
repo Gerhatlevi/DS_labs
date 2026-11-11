@@ -4,7 +4,7 @@ FROM golang:1.27.3-alpine AS builder
 WORKDIR /app
 
 # copy over the main files into the current dir
-COPY go.mod main.go ./
+COPY go.mod *.go ./
 
 # build the binary
 RUN go build -o http_server .

@@ -24,7 +24,6 @@ func handleFile(req *http.Request, res *http.Response) {
 		lock := locks.ForFile(fileName)
 		switch req.Method {
 		case "POST":
-			lock.Lock()
 			// Collect the file that was sent in this request and write to disk
 			file, _, err := req.FormFile("file")
 			if err != nil {
@@ -32,6 +31,7 @@ func handleFile(req *http.Request, res *http.Response) {
 				break
 			}
 			defer file.Close()
+			lock.Lock()
 			err = writeFile(fileName, file)
 			lock.Unlock()
 			if err != nil {
@@ -46,7 +46,6 @@ func handleFile(req *http.Request, res *http.Response) {
 			fd, err := readFile(fileName)
 			if err != nil {
 				res.StatusCode = http.StatusNotFound
-				break
 			} else {
 				res.StatusCode = http.StatusOK
 				setHeader(*res, "Content-type", contentType)

@@ -56,8 +56,6 @@ func (s *Semaphore) Release() {
 	<-s.Channel
 }
 
-var rwMutex = &sync.RWMutex{}
-
 func extensionToContentType() map[string]string {
 	return map[string]string{
 		"html": "text/html",
@@ -145,6 +143,7 @@ func handleConn(conn net.Conn) {
 	res.Proto = req.Proto
 	res.ProtoMajor = req.ProtoMajor
 	res.ProtoMinor = req.ProtoMinor
+	res.StatusCode = 0 // NOTE: this is used for error checking and must get set before sending to client
 	res.Header = make(map[string][]string)
 
 	if err != nil {
@@ -156,11 +155,13 @@ func handleConn(conn net.Conn) {
 	}
 
 	// handle the pub/sub first for this request
-	if !handlePubSub(req, &res) {
+	if !handlePubSub(req, &res, conn) {
 		// otherwise handle the file operation
 		handleFile(req, &res)
 	}
 
+	// apply the status text to the res object
+	res.Status = http.StatusText(res.StatusCode)
 	// write the http.Response object to the connection
 	res.Write(conn)
 	// properly close the connection once the file has been serviced
@@ -185,7 +186,7 @@ func main() {
 	if _, err := os.Stat(outFolder); os.IsNotExist(err) {
 		err := os.Mkdir(outFolder, 0755)
 		if err != nil {
-			log.Fatal("Failed to create directory: ", err)
+			log.Fatalf("Failed to create directory: %s", err)
 		}
 	}
 
