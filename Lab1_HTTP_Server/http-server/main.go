@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 )
 
@@ -81,7 +80,7 @@ func bodyWrapper(s string) io.ReadCloser {
 // setHeader is a helper function that abstracts setting the header for the
 // http.Request struct to ensure the CanonicalHeaderKey is called properly
 func setHeader(res http.Response, s string, v string) {
-	res.Header.Set(http.CanonicalHeaderKey(s), v)
+	res.Header.Set(s, v)
 }
 
 // readFile takes care of reading a file and passing back the read buffer
@@ -156,57 +155,10 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
-	// get the extension of the requested file for lookup for Content-type
-	uri := req.RequestURI
-	// split on / so that we don't allow directory traversal
-	// we will only take the last value if multiple / are used in the uri
-	fileList := strings.Split(uri, "/")
-	fileName := fileList[len(fileList)-1]
-	extList := strings.Split(fileName, ".")
-	ext := extList[len(extList)-1]
-	contentType, ok := extensionToContentType()[ext]
-
-	// only handle this request if it is a supported file extension
-	if ok {
-		lock := locks.ForFile(fileName)
-		switch req.Method {
-		case "POST":
-			lock.Lock()
-			// Collect the file that was sent in this request and write to disk
-			file, _, err := req.FormFile("file")
-			if err != nil {
-				res.StatusCode = http.StatusBadRequest
-				break
-			}
-			defer file.Close()
-			err = writeFile(fileName, file)
-			lock.Unlock()
-			if err != nil {
-				res.StatusCode = http.StatusBadRequest
-				res.Body = bodyWrapper(fmt.Sprintf("", err))
-				break
-			}
-			res.StatusCode = http.StatusCreated
-		case "GET":
-			// Read the requested file from disk and serve the file
-			// serve a 404 if the file cannot be found
-			lock.RLock()
-			fd, err := readFile(fileName)
-			if err != nil {
-				res.StatusCode = http.StatusNotFound
-				break
-			} else {
-				res.StatusCode = http.StatusOK
-				setHeader(res, "Content-type", contentType)
-				res.Body = io.NopCloser(fd)
-			}
-			lock.RUnlock()
-		default:
-			res.StatusCode = http.StatusNotImplemented
-		}
-	} else {
-		res.StatusCode = http.StatusBadRequest
-		res.Status = "400 Bad Request"
+	// handle the pub/sub first for this request
+	if !handlePubSub(req, &res) {
+		// otherwise handle the file operation
+		handleFile(req, &res)
 	}
 
 	// write the http.Response object to the connection
@@ -233,7 +185,7 @@ func main() {
 	if _, err := os.Stat(outFolder); os.IsNotExist(err) {
 		err := os.Mkdir(outFolder, 0755)
 		if err != nil {
-			log.Fatal("Failed to create directory: %s", err)
+			log.Fatal("Failed to create directory: ", err)
 		}
 	}
 

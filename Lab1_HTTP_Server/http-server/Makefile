@@ -1,7 +1,7 @@
 default: server
 
 server: main.go
-	go build
+	go build -o http_server
 
 test: clean server
 	./http_server 5555 &

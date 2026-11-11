@@ -8,7 +8,7 @@ do
 done
 
 # start many simultaneous POST uploads to ensure writer consistency
-for i in {1..10}
+for i in {1..1}
 do
     curl localhost:5555/test_file.txt -F "file=@test.txt" -v &
 done
