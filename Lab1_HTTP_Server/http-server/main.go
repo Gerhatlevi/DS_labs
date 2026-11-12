@@ -152,12 +152,16 @@ func handleConn(conn net.Conn, released *bool) {
 			HandlePublish(queryParams, req, &res)
 		} else if ok {
 			handlePostFile(fileName, req, &res)
+		} else {
+			res.StatusCode = http.StatusNotImplemented
 		}
 	case "GET":
 		if strings.HasPrefix(uri, "/events") {
 			HandleEvents(queryParams, &res, conn, released)
 		} else if ok {
 			handleGetFile(fileName, contentType, &res)
+		} else {
+			res.StatusCode = http.StatusNotImplemented
 		}
 	default:
 		res.StatusCode = http.StatusNotImplemented
