@@ -10,9 +10,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
+// High level constants for defining the number of
+// maxConCurrent service threads to manage each request
+// and defining an outFolder to get created and written to
+// for clients writing and reading files.
 const (
 	maxConCurrent = 10
 	outFolder     = "files"
@@ -52,6 +57,10 @@ func (m *LockManager) ForFile(path string) *sync.RWMutex {
 // to uploaded files in the given HTTP endpoints.
 var locks = NewLockManager()
 
+// Semaphore is an implementation of a semaphore using go buffered channels
+// here a struct{} is used since an empty struct is the smallest size
+// and has a width of 0. So this is an efficient mechanism for implementing
+// a Semaphore.
 // https://go-cookbook.com/snippets/concurrency/semaphores
 type Semaphore struct {
 	Channel chan struct{}
@@ -129,10 +138,33 @@ func handleConn(conn net.Conn, released *bool) {
 		return
 	}
 
-	// handle the pub/sub first for this request
-	if !handlePubSub(req, &res, conn, released) {
-		// otherwise handle the file operation
-		handleFile(req, &res)
+	uri := req.URL.Path
+	queryParams := req.URL.Query()
+	fileName, contentType, ok := getFileInfo(uri)
+
+	switch req.Method {
+	case "POST":
+		if strings.HasPrefix(uri, "/subscribe") {
+			HandleSubscribe(queryParams, &res)
+		} else if strings.HasPrefix(uri, "/unsubscribe") {
+			HandleUnsubscribe(queryParams, &res)
+		} else if strings.HasPrefix(uri, "/publish") {
+			HandlePublish(queryParams, req, &res)
+		} else if ok {
+			handlePostFile(fileName, req, &res)
+		} else {
+			res.StatusCode = http.StatusNotImplemented
+		}
+	case "GET":
+		if strings.HasPrefix(uri, "/events") {
+			HandleEvents(queryParams, &res, conn, released)
+		} else if ok {
+			handleGetFile(fileName, contentType, &res)
+		} else {
+			res.StatusCode = http.StatusNotImplemented
+		}
+	default:
+		res.StatusCode = http.StatusNotImplemented
 	}
 
 	// apply the status text to the res object
@@ -143,6 +175,7 @@ func handleConn(conn net.Conn, released *bool) {
 	conn.Close()
 }
 
+// main handles the entrypoint into the http_server logic flow
 func main() {
 	var port int
 

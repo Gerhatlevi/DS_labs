@@ -7,8 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -212,93 +212,79 @@ func handleEvents(topic string, id string, res *http.Response, conn net.Conn, re
 	}
 }
 
-// handlePubSub is the global function for handling a request in
-// the publisher subscriber model flow. Returns true if handle-able
-// by this flow, false if further processing should be done.
-//
-// NOTE: there is a function side effect of modifying the res
-// value. The response value, if handle-able by this function, will
-// be modified to have the body, statusCode, and additional HTTP
-// values allocated. No further processing is required in the res.
-func handlePubSub(req *http.Request, res *http.Response, conn net.Conn, released *bool) bool {
-	uri := req.URL.Path
-	queryParams := req.URL.Query()
+// HandleSubscribe is the main wrapper handler that invokes handleSubscribe
+// which manages creating and adding a particular id to the desired topic.
+func HandleSubscribe(queryParams url.Values, res *http.Response) {
+	// default to a bad request and have other functions set the proper
+	// status codes on different code flow
+	res.StatusCode = http.StatusBadRequest
+	if topicList := queryParams["topic"]; topicList != nil {
+		// only one topic is allowed to be subscribed to at a time
+		if len(topicList) == 1 {
+			handleSubscribe(topicList[0], res)
+		}
+	}
+}
 
-	switch req.Method {
-	case "POST":
-		if strings.HasPrefix(uri, "/subscribe") {
-			if topicList := queryParams["topic"]; topicList != nil {
-				// only one topic is allowed to be subscribed to at a time
-				if len(topicList) == 1 {
-					handleSubscribe(topicList[0], res)
-				} else {
-					res.StatusCode = http.StatusBadRequest
-				}
-			} else {
-				res.StatusCode = http.StatusBadRequest
-			}
-		} else if strings.HasPrefix(uri, "/unsubscribe") {
-			// there must be an id associates with this unsubscribe request
-			if idList := queryParams["id"]; idList != nil {
-				// only one id is allowed in this request
-				if len(idList) != 1 {
-					res.StatusCode = http.StatusBadRequest
-					return true
-				}
+// HandleUnsubscribe is the main wrapper handler that invokes handleUnsubscribe
+// which manages removing a particular id from a topic.
+func HandleUnsubscribe(queryParams url.Values, res *http.Response) {
+	// default to a bad request and have other functions set the proper
+	// status codes on different code flow
+	res.StatusCode = http.StatusBadRequest
 
-				// topic must also be provided in this request
-				if topicList := queryParams["topic"]; topicList != nil {
-					// only one topic is allowed in this request
-					if len(topicList) == 1 {
-						handleUnsubscribe(topicList[0], idList[0], res)
-					} else {
-						res.StatusCode = http.StatusBadRequest
-					}
-				} else {
-					res.StatusCode = http.StatusBadRequest
-				}
-			} else {
-				res.StatusCode = http.StatusBadRequest
-			}
-		} else if strings.HasPrefix(uri, "/publish") {
-			if topicList := queryParams["topic"]; topicList != nil {
-				// only one topic is allowed to be subscribed to at a time
-				if len(topicList) == 1 {
-					handlePublish(topicList[0], req, res)
-				} else {
-					res.StatusCode = http.StatusBadRequest
-				}
-			} else {
-				res.StatusCode = http.StatusBadRequest
+	// there must be an id associates with this unsubscribe request
+	if idList := queryParams["id"]; idList != nil {
+		// only one id is allowed in this request
+		if len(idList) != 1 {
+			res.StatusCode = http.StatusBadRequest
+			return
+		}
+
+		// topic must also be provided in this request
+		if topicList := queryParams["topic"]; topicList != nil {
+			// only one topic is allowed in this request
+			if len(topicList) == 1 {
+				handleUnsubscribe(topicList[0], idList[0], res)
 			}
 		}
-	case "GET":
-		if strings.HasPrefix(uri, "/events") {
-			// there must be an id associates with this events request
-			if idList := queryParams["id"]; idList != nil {
-				// only one id is allowed in this request
-				if len(idList) != 1 {
-					res.StatusCode = http.StatusBadRequest
-					return true
-				}
-				if topicList := queryParams["topic"]; topicList != nil {
-					// only one topic is allowed in this request
-					if len(topicList) == 1 {
-						handleEvents(topicList[0], idList[0], res, conn, released)
-					} else {
-						res.StatusCode = http.StatusBadRequest
-					}
-				}
-			} else {
-				res.StatusCode = http.StatusBadRequest
+	}
+}
+
+// HandlePublish is the main handler wrapper that invokes handlePublish to perform the actual
+// work for this client connection to write data for a particular topic.
+func HandlePublish(queryParams url.Values, req *http.Request, res *http.Response) {
+	// default to a bad request and have other functions set the proper
+	// status codes on different code flow
+	res.StatusCode = http.StatusBadRequest
+
+	if topicList := queryParams["topic"]; topicList != nil {
+		// only one topic is allowed to be subscribed to at a time
+		if len(topicList) == 1 {
+			handlePublish(topicList[0], req, res)
+		}
+	}
+}
+
+// HandleEvents is the main handler wrapper that invokes handleEvents to perform the actual work
+// of managing this connection and writing any messages that were published on the provided topic.
+func HandleEvents(queryParams url.Values, res *http.Response, conn net.Conn, released *bool) {
+	// default to a bad request and have other functions set the proper
+	// status codes on different code flow
+	res.StatusCode = http.StatusBadRequest
+
+	// there must be an id associates with this events request
+	if idList := queryParams["id"]; idList != nil {
+		// only one id is allowed in this request
+		if len(idList) != 1 {
+			res.StatusCode = http.StatusBadRequest
+			return
+		}
+		if topicList := queryParams["topic"]; topicList != nil {
+			// only one topic is allowed in this request
+			if len(topicList) == 1 {
+				handleEvents(topicList[0], idList[0], res, conn, released)
 			}
 		}
-	default:
-		res.StatusCode = http.StatusNotImplemented
 	}
-
-	if res.StatusCode == http.StatusNotImplemented || res.StatusCode == 0 {
-		return false
-	}
-	return true
 }
