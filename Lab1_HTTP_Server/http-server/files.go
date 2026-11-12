@@ -1,11 +1,65 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path"
 	"strings"
 )
+
+// readFile takes care of reading a file and passing back the read buffer
+// to stream back to the user for a GET request
+func readFile(name string) (io.Reader, error) {
+	inPath := path.Join(outFolder, name)
+	file, err := os.Open(inPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// create the read buffer to stream to the user
+	r := bufio.NewReader(file)
+	return r, nil
+}
+
+// writeFile takes care of writing a stream that came from the user POST
+// request and writing to the desired file name. Heavily inspired from
+// https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-a-file-using-go
+func writeFile(name string, f multipart.File) error {
+	outPath := path.Join(outFolder, name)
+	r := bufio.NewReader(f)
+
+	// create the output file if not exists
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+
+	w := bufio.NewWriter(out)
+
+	// copy over chunks of 1024 bytes from the input multipart file
+	// to the newly created file
+	buf := make([]byte, 1024)
+	for {
+		n, err := r.Read(buf)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n == 0 {
+			break
+		}
+		if _, err := w.Write(buf[:n]); err != nil {
+			return err
+		}
+	}
+	if err = w.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
 
 func handleFile(req *http.Request, res *http.Response) {
 	// get the extension of the requested file for lookup for Content-type

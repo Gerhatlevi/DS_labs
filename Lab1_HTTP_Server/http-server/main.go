@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"strconv"
 	"sync"
 )
@@ -25,23 +23,33 @@ type LockManager struct {
 	locks map[string]*sync.RWMutex
 }
 
+// NewLockManager is used for instantiating the LockManager
+// with a new map for fileName (string) -> lock (*sync.RWMutex)
 func NewLockManager() *LockManager {
 	return &LockManager{locks: make(map[string]*sync.RWMutex)}
 }
 
+// ForFile creates a new RWMutex for a file if it does not exist
+// yet and returns the existing lock if it does exist. This allows
+// better throughput to provide concurrency on a per file basis instead
+// of a global mutex for all files.
 func (m *LockManager) ForFile(path string) *sync.RWMutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// if the lock exists already, return it
 	if lock := m.locks[path]; lock != nil {
 		return lock
 	}
 
+	// otherwise, create a new lock for this file
 	lock := &sync.RWMutex{}
 	m.locks[path] = lock
 	return lock
 }
 
+// locks is a global lock manager for synchronizing reads and writes
+// to uploaded files in the given HTTP endpoints.
 var locks = NewLockManager()
 
 // https://go-cookbook.com/snippets/concurrency/semaphores
@@ -49,13 +57,29 @@ type Semaphore struct {
 	Channel chan struct{}
 }
 
+// Acquire is used for adding a single empty struct to the
+// Channel and when the semaphore is created, it is made with
+// a Buffered Channel. So when the Channel is full, the thread
+// is blocked.
 func (s *Semaphore) Acquire() {
 	s.Channel <- struct{}{}
 }
+
+// Release is similar to Acquire but just pops a value out of
+// the Buffered Channel to make space for the next blocking
+// thread if one exists. Similar to that of a counting semaphore.
 func (s *Semaphore) Release() {
 	<-s.Channel
 }
 
+// create the Semaphore sem as a Buffered Channel with the
+// maxConCurrent desired variable. This will be used for blocking
+// an additional go routine and have a max maxConCurrent threads
+// servicing data at any given time.
+var sem = &Semaphore{Channel: make(chan struct{}, maxConCurrent)}
+
+// extensionToContentType is a simple mapping of supported file extensions
+// to their respecive Content-Type strings for responses in GET requests.
 func extensionToContentType() map[string]string {
 	return map[string]string{
 		"html": "text/html",
@@ -81,81 +105,32 @@ func setHeader(res http.Response, s string, v string) {
 	res.Header.Set(s, v)
 }
 
-// readFile takes care of reading a file and passing back the read buffer
-// to stream back to the user for a GET request
-func readFile(name string) (io.Reader, error) {
-	inPath := path.Join(outFolder, name)
-	file, err := os.Open(inPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// create the read buffer to stream to the user
-	r := bufio.NewReader(file)
-	return r, nil
-}
-
-// writeFile takes care of writing a stream that came from the user POST
-// request and writing to the desired file name. Heavily inspired from
-// https://stackoverflow.com/questions/1821811/how-to-read-write-from-to-a-file-using-go
-func writeFile(name string, f multipart.File) error {
-	outPath := path.Join(outFolder, name)
-	r := bufio.NewReader(f)
-
-	// create the output file if not exists
-	out, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-
-	w := bufio.NewWriter(out)
-
-	// copy over chunks of 1024 bytes from the input multipart file
-	// to the newly created file
-	buf := make([]byte, 1024)
-	for {
-		n, err := r.Read(buf)
-		if err != nil && err != io.EOF {
-			return err
-		}
-		if n == 0 {
-			break
-		}
-		if _, err := w.Write(buf[:n]); err != nil {
-			return err
-		}
-	}
-	if err = w.Flush(); err != nil {
-		return err
-	}
-	return nil
-}
-
 // handleConn is the main HTTP handler for the server that involves
 // serving a file on GET requests and storing a file for POST requests
-func handleConn(conn net.Conn) {
+func handleConn(conn net.Conn, released *bool) {
 	// parse the connection as an HTTP request to simplify logic
 	reader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(reader)
 
 	// setup the response object to simplify returning
 	res := http.Response{}
-	res.Proto = req.Proto
-	res.ProtoMajor = req.ProtoMajor
-	res.ProtoMinor = req.ProtoMinor
+	// always communicate with HTTP/1.0
+	res.Proto = "HTTP/1.0"
+	res.ProtoMajor = 1
+	res.ProtoMinor = 0
 	res.StatusCode = 0 // NOTE: this is used for error checking and must get set before sending to client
 	res.Header = make(map[string][]string)
 
 	if err != nil {
 		res.StatusCode = http.StatusBadRequest
-		res.Status = "400 Bad Request"
+		res.Status = http.StatusText(res.StatusCode)
 		res.Write(conn)
 		conn.Close()
 		return
 	}
 
 	// handle the pub/sub first for this request
-	if !handlePubSub(req, &res, conn) {
+	if !handlePubSub(req, &res, conn, released) {
 		// otherwise handle the file operation
 		handleFile(req, &res)
 	}
@@ -169,17 +144,16 @@ func handleConn(conn net.Conn) {
 }
 
 func main() {
-	// NOTE: this should also take first arg if -port is not specified
 	var port int
 
 	if len(os.Args) > 1 {
 		var err error
 		port, err = strconv.Atoi(os.Args[1])
 		if err != nil {
-			log.Fatal("usage: http_server <port>")
+			log.Fatal("usage: http-server <port>")
 		}
 	} else {
-		log.Fatal("usage: http_server <port>")
+		log.Fatal("usage: http-server <port>")
 	}
 
 	// create a folder to segment the uploaded files
@@ -199,7 +173,6 @@ func main() {
 		return
 	}
 
-	sem := &Semaphore{Channel: make(chan struct{}, maxConCurrent)}
 	// handle incoming connections and spawn off additional goroutines
 	for {
 		conn, err := ln.Accept()
@@ -208,13 +181,24 @@ func main() {
 			continue
 		}
 
+		// block until there are less than maxConCurrent threads running
 		sem.Acquire()
-		// create a goroutine to handle this connection
-		// NOTE: need to add in a check here to ensure we aren't exceeding maxConcurrent
-		go func(conn net.Conn) {
-			defer sem.Release()
-			handleConn(conn)
-		}(conn)
 
+		// create a goroutine to handle this connection
+		go func(conn net.Conn) {
+			// allow the handleConn function to preemptively release the
+			// semaphore in the case of the long running clients
+			released := false
+
+			// release the semaphore on connection termination
+			defer func() {
+				if !released {
+					sem.Release()
+				}
+			}()
+
+			// actually process this request
+			handleConn(conn, &released)
+		}(conn)
 	}
 }

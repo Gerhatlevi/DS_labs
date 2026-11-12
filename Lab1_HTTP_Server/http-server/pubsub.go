@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -16,18 +18,28 @@ import (
 // mutex to protect writes to the global topic data
 var topicMu sync.Mutex
 
-// mutex to protect writes to the global conn data
-var connMu sync.Mutex
+// subChannelSize is used for tracking the size of the channels in the
+// subChannelMap mapping. This allows for a max of subChannelSize messages
+// to be placed into each queue.
+const subChannelSize = 10
+
+// eventsTimeoutSec is used for setting the timeout on a reading client
+// that is waiting for an event on a provided topic.
+const eventsTimeoutSec = 30
+
+// Subscriber is a struct to compactly manage subscriber ids and their
+// corresponding Buffered Channel for messages
+type Subscriber struct {
+	id     string
+	buffer chan string
+	lock   *sync.Mutex
+}
 
 // topic map to keep track of topics and subscribers for event publishing
 // NOTE: this could probably be better implemented with a different more
 // performant data structure for looking up ids to be more scalable for
 // a large N number of subscribers per topic.
-var topicMap = make(map[string][]string)
-
-// connMap is used to keep track of open connections which will receive
-// messages that are published for a particular topic
-var connMap = make(map[string]net.Conn)
+var topicMap = make(map[string][]*Subscriber)
 
 // handleSubscribe handles the main operation of creating a new id and subscribing
 // a requesting client to a particular content. This primarily creates a new entry
@@ -39,7 +51,8 @@ func handleSubscribe(topic string, res *http.Response) {
 	uuid := uuid.New()
 	topicMu.Lock()
 	log.Printf("Adding UUID %s to topic %s", uuid.String(), topic)
-	topicMap[topic] = append(topicMap[topic], uuid.String())
+	subscriber := Subscriber{id: uuid.String(), buffer: make(chan string, subChannelSize), lock: &sync.Mutex{}}
+	topicMap[topic] = append(topicMap[topic], &subscriber)
 	topicMu.Unlock()
 
 	// return the created id back to the requesting client
@@ -57,18 +70,21 @@ func handleUnsubscribe(topic string, id string, res *http.Response) {
 	log.Printf("Removing UUID %s from topic %s", id, topic)
 
 	// need to check if id in the topicMap and if so, remove from the list
-	idIdx := slices.Index(topicMap[topic], id)
 	success := false
-	if idIdx == -1 {
-		// error case, not found in subscriber list
-		res.StatusCode = http.StatusOK
-	} else {
-		// delete the element from the slice
-		topicMap[topic] = slices.Delete(topicMap[topic], idIdx, idIdx+1)
-		res.StatusCode = http.StatusOK
-		success = true
+	res.StatusCode = http.StatusOK
+	for idx, subscriber := range topicMap[topic] {
+		if subscriber.id == id {
+			// delete the element from the slice
+			topicMap[topic] = slices.Delete(topicMap[topic], idx, idx+1)
+			success = true
+			break
+		}
 	}
 	topicMu.Unlock()
+
+	if !success {
+		res.StatusCode = http.StatusNotFound
+	}
 
 	// return the created id back to the requesting client
 	setHeader(*res, "Content-type", "application/json")
@@ -99,23 +115,16 @@ func handlePublish(topic string, req *http.Request, res *http.Response) {
 			return
 		}
 
-		// create a new message response to write to all subscribers
-		resMessage := http.Response{}
-		resMessage.Proto = req.Proto
-		resMessage.ProtoMajor = req.ProtoMajor
-		resMessage.ProtoMinor = req.ProtoMinor
-		resMessage.StatusCode = http.StatusOK
-		resMessage.Header = make(map[string][]string)
-		resMessage.Body = bodyWrapper(fmt.Sprintf("%s", message))
+		for _, subscriber := range idList {
+			// write the content of the message to each subscriber buffer
+			subscriber.lock.Lock()
+			channelLen := len(subscriber.buffer)
 
-		for _, uuid := range idList {
-			// lookup the client connections and send the message to each
-			connMu.Lock()
-			if conn, ok := connMap[uuid]; ok {
-				resMessage.Write(conn)
-				conn.Close()
+			// only write to this channel if there is space in the buffer
+			if channelLen < subChannelSize {
+				subscriber.buffer <- string(message)
 			}
-			connMu.Unlock()
+			subscriber.lock.Unlock()
 		}
 	} else {
 		// if no subscribers, this is okay. Scream into the void
@@ -132,24 +141,70 @@ func handlePublish(topic string, req *http.Request, res *http.Response) {
 //
 // NOTE: conn is needed here to write intermitten values if many messages are
 // published while the client is active.
-func handleEvents(topic string, id string, res *http.Response, conn net.Conn) {
+func handleEvents(topic string, id string, res *http.Response, conn net.Conn, released *bool) {
 	if idList, ok := topicMap[topic]; ok {
 		res.StatusCode = http.StatusOK
+
 		// ensure the provided ID is subscribed to the topic
-		idIdx := slices.Index(idList, id)
-		if idIdx == -1 {
-			res.StatusCode = http.StatusBadRequest
+		subscriber := func(uuid string, list []*Subscriber) *Subscriber {
+			for _, sub := range list {
+				if sub.id == uuid {
+					return sub
+				}
+			}
+			return nil
+		}(id, idList)
+
+		if subscriber == nil {
+			res.StatusCode = http.StatusNotFound
 			res.Body = bodyWrapper(fmt.Sprintf("{\"error\": \"ID: %s is not subscribed to topic: %s\"}\n", id, topic))
 			return
 		}
-		// add this connection to the current list of open connections
-		connMu.Lock()
-		connMap[id] = conn
-		connMu.Unlock()
+
+		// release the semaphore to allow other tasks to process
+		*released = true
+		sem.Release()
+
+		// set the timeout for this connection
+		timeout := eventsTimeoutSec * time.Second
+		startTime := time.Now()
 
 		// sit forever and let the publisher do it's work
 		for {
-			// TODO: add a timeout message here or keep connection open
+			// check this channel to see if there is data available to write
+			subscriber.lock.Lock()
+			channelLen := len(subscriber.buffer)
+
+			// only read from this Channel if there is data to be consumed
+			// otherwise the reader is blocked until data comes in on the
+			// Channel. This will consume all current messages in the queue.
+			messages := []string{}
+			for range channelLen {
+				msg := <-subscriber.buffer
+				messages = append(messages, msg)
+			}
+			subscriber.lock.Unlock()
+
+			// write the data and close this connection
+			if len(messages) > 0 {
+				messagesJson, err := json.Marshal(messages)
+				if err != nil {
+					log.Printf("Failed to marshal messages to json: %s", err)
+					messagesJson, _ = json.Marshal("error")
+				}
+				res.Body = bodyWrapper(string(messagesJson))
+				res.Write(conn)
+				conn.Close()
+				return
+			}
+
+			// check the timeout
+			if time.Since(startTime) > timeout {
+				res.StatusCode = http.StatusNoContent
+				res.Write(conn)
+				conn.Close()
+				return
+			}
 		}
 	} else {
 		res.StatusCode = http.StatusBadRequest
@@ -165,7 +220,7 @@ func handleEvents(topic string, id string, res *http.Response, conn net.Conn) {
 // value. The response value, if handle-able by this function, will
 // be modified to have the body, statusCode, and additional HTTP
 // values allocated. No further processing is required in the res.
-func handlePubSub(req *http.Request, res *http.Response, conn net.Conn) bool {
+func handlePubSub(req *http.Request, res *http.Response, conn net.Conn, released *bool) bool {
 	uri := req.URL.Path
 	queryParams := req.URL.Query()
 
@@ -229,7 +284,7 @@ func handlePubSub(req *http.Request, res *http.Response, conn net.Conn) bool {
 				if topicList := queryParams["topic"]; topicList != nil {
 					// only one topic is allowed in this request
 					if len(topicList) == 1 {
-						handleEvents(topicList[0], idList[0], res, conn)
+						handleEvents(topicList[0], idList[0], res, conn, released)
 					} else {
 						res.StatusCode = http.StatusBadRequest
 					}
