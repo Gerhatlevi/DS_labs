@@ -25,7 +25,7 @@ const subChannelSize = 10
 
 // eventsTimeoutSec is used for setting the timeout on a reading client
 // that is waiting for an event on a provided topic.
-const eventsTimeoutSec = 30
+const eventsTimeoutSec = 15
 
 // Subscriber is a struct to compactly manage subscriber ids and their
 // corresponding Buffered Channel for messages
@@ -66,15 +66,15 @@ func handleSubscribe(topic string, res *http.Response) {
 // the topicMap if it exists and does nothing on error to prevent information
 // disclosure.
 func handleUnsubscribe(topic string, id string, res *http.Response) {
-	topicMu.Lock()
-	log.Printf("Removing UUID %s from topic %s", id, topic)
-
-	// need to check if id in the topicMap and if so, remove from the list
 	success := false
 	res.StatusCode = http.StatusOK
+
+	topicMu.Lock()
+	// need to check if id in the topicMap and if so, remove from the list
 	for idx, subscriber := range topicMap[topic] {
 		if subscriber.id == id {
 			// delete the element from the slice
+			log.Printf("Removing UUID %s from topic %s", id, topic)
 			topicMap[topic] = slices.Delete(topicMap[topic], idx, idx+1)
 			success = true
 			break
