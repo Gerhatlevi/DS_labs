@@ -7,6 +7,7 @@ test: clean server
 	./http_server 5555 &
 	sleep 1
 	./test.sh
+	make clean
 
 clean:
 	# kill the existing http server if found
