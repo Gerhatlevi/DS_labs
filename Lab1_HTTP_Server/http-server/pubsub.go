@@ -25,7 +25,7 @@ const subChannelSize = 10
 
 // eventsTimeoutSec is used for setting the timeout on a reading client
 // that is waiting for an event on a provided topic.
-const eventsTimeoutSec = 30
+const eventsTimeoutSec = 15
 
 // Subscriber is a struct to compactly manage subscriber ids and their
 // corresponding Buffered Channel for messages

@@ -153,7 +153,7 @@ func handleConn(conn net.Conn, released *bool) {
 		} else if ok {
 			handlePostFile(fileName, req, &res)
 		} else {
-			res.StatusCode = http.StatusNotImplemented
+			res.StatusCode = http.StatusBadRequest
 		}
 	case "GET":
 		if strings.HasPrefix(uri, "/events") {
@@ -161,7 +161,7 @@ func handleConn(conn net.Conn, released *bool) {
 		} else if ok {
 			handleGetFile(fileName, contentType, &res)
 		} else {
-			res.StatusCode = http.StatusNotImplemented
+			res.StatusCode = http.StatusBadRequest
 		}
 	default:
 		res.StatusCode = http.StatusNotImplemented
