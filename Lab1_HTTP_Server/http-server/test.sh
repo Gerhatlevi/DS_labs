@@ -82,7 +82,7 @@ echo "    Missing topic:"
 echo "    $(curl -s -i "$BASE_URL/events?id=$SUB_ID")"
 
 echo "    Invalid publish request:"
-echo "    $(curl -s -i "$BASE_URL/publish?topic=X" -X POST)"
+echo "    $(curl -s -i "$BASE_URL/publish?topic=X")"
 
 # 6. Unsubscribe
 echo
