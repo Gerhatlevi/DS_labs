@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -101,7 +102,7 @@ func handlePostFile(fileName string, req *http.Request, res *http.Response) {
 
 // handleGetFile is the main handler for attempting to read a file from the directory
 // that files get written to via the handlePostFile handler.
-func handleGetFile(fileName string, contentType string, res *http.Response) {
+func handleGetFile(fileName string, contentType string, res *http.Response, conn net.Conn) {
 	lock := locks.ForFile(fileName)
 
 	// Read the requested file from disk and serve the file
@@ -115,5 +116,13 @@ func handleGetFile(fileName string, contentType string, res *http.Response) {
 		setHeader(*res, "Content-type", contentType)
 		res.Body = io.NopCloser(fd)
 	}
+
+	// apply the status text to the res object
+	res.Status = http.StatusText(res.StatusCode)
+	// write the http.Response object to the connection
+	res.Write(conn)
+	// properly close the connection once the file has been serviced
+	conn.Close()
+
 	lock.RUnlock()
 }

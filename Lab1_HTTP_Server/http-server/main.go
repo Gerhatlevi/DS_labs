@@ -159,7 +159,9 @@ func handleConn(conn net.Conn, released *bool) {
 		if strings.HasPrefix(uri, "/events") {
 			HandleEvents(queryParams, &res, conn, released)
 		} else if ok {
-			handleGetFile(fileName, contentType, &res)
+			handleGetFile(fileName, contentType, &res, conn)
+			// handleGetFile handles terminating the connection
+			return
 		} else {
 			res.StatusCode = http.StatusBadRequest
 		}
