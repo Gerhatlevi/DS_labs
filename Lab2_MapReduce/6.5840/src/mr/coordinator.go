@@ -6,42 +6,103 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
+	"time"
 )
 
-type Coordinator struct {
-	files          []string
-	currentFileIdx int
-	workingFiles   map[string]int
-	numReduce      int
-	mapComplete    bool
-	reduceComplete bool
+type TaskStatus int
+
+const (
+	Idle TaskStatus = iota
+	InProgress
+	Completed
+)
+
+type Task struct {
+	Status    TaskStatus
+	FileName  string // only for map tasks
+	StartTime time.Time
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
+type Coordinator struct {
+	mu          sync.Mutex // cus every RPC is a different goroutine we have to make sure at one given time only 1 R/W the tasks arrays
+	mapTasks    []Task
+	reduceTasks []Task
+	nMap        int
+	nReduce     int
+	allDone     bool
 }
 
 func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
-	if c.currentFileIdx >= len(c.files) {
-		// look for reduce jobs if map is all done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	allMapsDone := true
+	for i := range c.mapTasks {
+		if c.mapTasks[i].Status != Completed {
+			allMapsDone = false
+		}
+		if c.mapTasks[i].Status == Idle ||
+			(c.mapTasks[i].Status == InProgress && time.Since(c.mapTasks[i].StartTime) > 10*time.Second) {
+
+			c.mapTasks[i].Status = InProgress
+			c.mapTasks[i].StartTime = time.Now()
+
+			reply.TaskType = MapTask
+			reply.TaskID = i
+			reply.FileName = c.mapTasks[i].FileName
+			reply.NReduce = c.nReduce
+			reply.NMap = c.nMap
+			return nil
+		}
+	}
+	if !allMapsDone {
+		reply.TaskType = WaitTask
 		return nil
 	}
-	// lookup which files we still have left
-	reply.workerID = c.currentFileIdx
-	reply.fileName = c.files[c.currentFileIdx]
-	reply.nReduce = c.numReduce
+	allReducesDone := true
+	for i := range c.reduceTasks {
+		if c.reduceTasks[i].Status != Completed {
+			allReducesDone = false
+		}
+		if c.reduceTasks[i].Status == Idle ||
+			(c.reduceTasks[i].Status == InProgress && time.Since(c.reduceTasks[i].StartTime) > 10*time.Second) {
 
-	c.currentFileIdx = c.currentFileIdx + 1
+			c.reduceTasks[i].Status = InProgress
+			c.reduceTasks[i].StartTime = time.Now()
+
+			reply.TaskType = ReduceTask
+			reply.TaskID = i
+			reply.NReduce = c.nReduce
+			reply.NMap = c.nMap
+			return nil
+		}
+	}
+	if !allReducesDone {
+		reply.TaskType = WaitTask
+		return nil
+	}
+
+	c.allDone = true
+	reply.TaskType = ExitTask
 	return nil
 }
 
 func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch args.TaskType {
+	case MapTask:
+		if c.mapTasks[args.TaskID].Status == InProgress { //check because it can happen that slower tasks finished after a faster completed that beforehand
+			c.mapTasks[args.TaskID].Status = Completed
+		}
+	case ReduceTask:
+		if c.reduceTasks[args.TaskID].Status == InProgress {
+			c.reduceTasks[args.TaskID].Status = Completed
+		}
+	}
+
 	return nil
 }
 
@@ -62,7 +123,9 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.reduceComplete
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.allDone
 }
 
 // create a Coordinator.
@@ -70,17 +133,25 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		files:          files,
-		currentFileIdx: 0,
-		workingFiles:   make(map[string]int),
-		numReduce:      nReduce,
-		mapComplete:    false,
-		reduceComplete: false}
+		mapTasks:    make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+		nMap:        len(files),
+		nReduce:     nReduce,
+		allDone:     false,
+	}
 
-	// the finally spin off the reduce workers to perform the reduce function
-	// we essentially need to have a pool of workers that we keep calling
-	// the mapf for until all files are processed then we call reduce on all
-	// of the workers until all intermediate files are processed
+	for i, file := range files {
+		c.mapTasks[i] = Task{
+			Status:   Idle,
+			FileName: file,
+		}
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{
+			Status: Idle,
+		}
+	}
 
 	c.server()
 	return &c
