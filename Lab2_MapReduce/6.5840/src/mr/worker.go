@@ -43,6 +43,10 @@ func handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
 	encoders := make([]*json.Encoder, reply.NReduce)
 
 	for i := 0; i < reply.NReduce; i++ {
+		// we work off of temporary files to reduce the complexity and need for locking each intermediate
+		// file in the case of backup jobs or workers writing to the same file.
+		// The temporary file is then renamed to the true output file name which is an atomic operation
+		// and does not require mutexes.
 		tmpFile, err := os.CreateTemp(".", fmt.Sprintf("mr-map-tmp-%d-%d-*", reply.TaskID, i))
 		if err != nil {
 			return err
@@ -66,7 +70,8 @@ func handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
 			return err
 		}
 		finalName := fmt.Sprintf("mr-%d-%d", reply.TaskID, i)
-		if err := os.Rename(tmpName, finalName); err != nil { // https://www.youtube.com/watch?v=FEIbpHe75vY
+		if err := os.Rename(tmpName, finalName); err != nil {
+			// https://www.youtube.com/watch?v=FEIbpHe75vY
 			return err
 		}
 	}
@@ -111,13 +116,13 @@ func handleReduce(reply WorkerReply, reducef func(string, []string) string) erro
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
+
+		values := []string{intermediate[i].Value}
 		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			values = append(values, intermediate[j].Value)
 			j++
 		}
-		var values []string
-		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
-		}
+
 		output := reducef(intermediate[i].Key, values)
 
 		// Required output format: "%v %v\n"

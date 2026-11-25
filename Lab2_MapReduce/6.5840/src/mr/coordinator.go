@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -37,6 +38,7 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// check if we have any map jobs first that need to be completed
 	allMapsDone := true
 	for i := range c.mapTasks {
 		if c.mapTasks[i].Status != Completed {
@@ -48,6 +50,7 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			c.mapTasks[i].Status = InProgress
 			c.mapTasks[i].StartTime = time.Now()
 
+			// update the reply to the correct data for the worker job
 			reply.TaskType = MapTask
 			reply.TaskID = i
 			reply.FileName = c.mapTasks[i].FileName
@@ -56,10 +59,14 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			return nil
 		}
 	}
+
+	// make the worker wait if we are still working on the map phase
 	if !allMapsDone {
 		reply.TaskType = WaitTask
 		return nil
 	}
+
+	// start giving out the reduce jobs since we know the map stage is complete
 	allReducesDone := true
 	for i := range c.reduceTasks {
 		if c.reduceTasks[i].Status != Completed {
@@ -78,6 +85,8 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			return nil
 		}
 	}
+
+	// make the worker wait in case we need to kick off a backup job for a slow or failed reduce worker
 	if !allReducesDone {
 		reply.TaskType = WaitTask
 		return nil
@@ -88,19 +97,36 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 	return nil
 }
 
+// moveStatus is a helper function to move the status through the state
+// machine and report errors for unexpected results
+func moveStatus(task *Task) error {
+	switch task.Status {
+	case InProgress:
+		task.Status = Completed
+	case Idle:
+		return errors.New("cannot complete a non started task")
+	}
+	return nil
+}
+
 func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var task *Task
 	switch args.TaskType {
+	// need to check because it can happen that slower tasks finished after a faster completed that beforehand
 	case MapTask:
-		if c.mapTasks[args.TaskID].Status == InProgress { //check because it can happen that slower tasks finished after a faster completed that beforehand
-			c.mapTasks[args.TaskID].Status = Completed
-		}
+		task = &c.mapTasks[args.TaskID]
 	case ReduceTask:
-		if c.reduceTasks[args.TaskID].Status == InProgress {
-			c.reduceTasks[args.TaskID].Status = Completed
-		}
+		task = &c.reduceTasks[args.TaskID]
+	default:
+		return errors.New("task type not supported")
+	}
+
+	if err := moveStatus(task); err != nil {
+		log.Print(err)
+		return err
 	}
 
 	return nil
