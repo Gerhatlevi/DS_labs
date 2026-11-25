@@ -6,9 +6,10 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
-	"os"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type TaskStatus int
@@ -19,19 +20,46 @@ const (
 	Completed
 )
 
+type WorkerData struct {
+	ipAddr       string
+	ipPort       int
+	progressRate float64
+}
+
 type Task struct {
-	Status    TaskStatus
-	FileName  string // only for map tasks
-	StartTime time.Time
+	Status       TaskStatus
+	FileName     string // only for map tasks
+	LocationIP   string
+	LocationPort int
+	StartTime    time.Time
 }
 
 type Coordinator struct {
-	mu          sync.Mutex // cus every RPC is a different goroutine we have to make sure at one given time only 1 R/W the tasks arrays
+	// since every RPC is a different goroutine we have to make sure at one given time only 1 R/W the tasks arrays
+	mu          sync.Mutex
+	workers     map[string]WorkerData
 	mapTasks    []Task
 	reduceTasks []Task
 	nMap        int
 	nReduce     int
 	allDone     bool
+}
+
+func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegisterReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	uuid := uuid.New().String()
+	c.workers[uuid] = WorkerData{
+		ipAddr:       args.IpAddress,
+		ipPort:       args.Port,
+		progressRate: 0,
+	}
+
+	// worker should use this uuid for reporting status information
+	reply.Uuid = uuid
+	log.Printf("new uuid: %s, ip: %s, port: %d", uuid, args.IpAddress, args.Port)
+	return nil
 }
 
 func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
@@ -54,6 +82,10 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			reply.TaskType = MapTask
 			reply.TaskID = i
 			reply.FileName = c.mapTasks[i].FileName
+			// we are reading and replying with the full file data here for the worker
+			if content, err := readFile(reply.FileName); err == nil {
+				reply.FileData = content
+			}
 			reply.NReduce = c.nReduce
 			reply.NMap = c.nMap
 			return nil
@@ -136,10 +168,10 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
-	sockname := coordinatorSock()
-	os.Remove(sockname)
-	l, e := net.Listen("unix", sockname)
+	//sockname := coordinatorSock()
+	//os.Remove(sockname)
+	//l, e := net.Listen("unix", sockname)
+	l, e := net.Listen("tcp", ":1234")
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -158,7 +190,10 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	// TODO: also keep track here for connections to tell other workers
+	// where to go to collect intermediate jobs
 	c := Coordinator{
+		workers:     make(map[string]WorkerData),
 		mapTasks:    make([]Task, len(files)),
 		reduceTasks: make([]Task, nReduce),
 		nMap:        len(files),

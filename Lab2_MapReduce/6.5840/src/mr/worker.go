@@ -5,16 +5,46 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log"
+	"net"
+	"net/http"
 	"net/rpc"
 	"os"
 	"sort"
+	"strconv"
+	"sync"
 	"time"
 )
+
+const DEFAULT_RPC_PORT = "5555"
+
+type WorkerState struct {
+	mu                 sync.Mutex
+	mapIDs             []int
+	servePort          int
+	coordinatorAddress string
+	registered         bool
+	uuid               string
+}
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
+}
+
+// Used for getting the current outbound ip address that can be used for
+// taken from https://stackoverflow.com/questions/23558425/how-do-i-get-the-local-ip-address-in-go
+func getIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+
+	return string(localAddr.IP)
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -25,18 +55,22 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
-	file, err := os.Open(reply.FileName)
+func readFile(fileName string) ([]byte, error) {
+	file, err := os.Open(fileName)
 	if err != nil {
-		return err
+		return []byte{}, err
 	}
 	content, err := io.ReadAll(file)
 	file.Close()
 	if err != nil {
-		return err
+		return []byte{}, err
 	}
 
-	mapResults := mapf(reply.FileName, string(content))
+	return content, err
+}
+
+func handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
+	mapResults := mapf(reply.FileName, string(reply.FileData))
 
 	// Create nReduce temporary files for consistency
 	tmpFiles := make([]*os.File, reply.NReduce)
@@ -81,6 +115,8 @@ func handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
 
 func handleReduce(reply WorkerReply, reducef func(string, []string) string) error {
 	var intermediate []KeyValue
+
+	// TODO: get the intermediate files from the workers
 
 	// Read all intermediate files mr-0-Y ... mr-(NMap-1)-Y
 	for i := 0; i < reply.NMap; i++ {
@@ -140,15 +176,57 @@ func handleReduce(reply WorkerReply, reducef func(string, []string) string) erro
 	return os.Rename(tmpName, finalName)
 }
 
+func initializeWorkerState() *WorkerState {
+	rpcEnvVar := os.Getenv("WORKER_RPC_PORT")
+	if rpcEnvVar == "" {
+		rpcEnvVar = DEFAULT_RPC_PORT
+	}
+	servePort, err := strconv.Atoi(rpcEnvVar)
+	if err != nil {
+		log.Fatal("failed to parse environment var WORKER_RPC_PORT, should be valid port example: WORKER_RPC_PORT=5555")
+	}
+
+	coordinatorAddress := os.Getenv("COORDINATOR_ADDRESS")
+	if coordinatorAddress == "" {
+		log.Fatal("COORDINATOR_ADDRESS environment variable must be set and include port info like 'localhost:1234'")
+	}
+
+	worker := WorkerState{
+		mapIDs:             []int{},
+		servePort:          servePort,
+		coordinatorAddress: coordinatorAddress,
+		registered:         false,
+	}
+
+	return &worker
+}
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+
+	worker := initializeWorkerState()
+	// listen for rpc calls
+	worker.server()
+
+	args := WorkerRegisterArgs{
+		IpAddress: getIP(),
+		Port:      worker.servePort,
+	}
+	reply := WorkerRegisterReply{}
+	if ok := worker.call("Coordinator.RegisterWorker", &args, &reply); ok {
+		worker.registered = true
+		worker.uuid = reply.Uuid
+	} else {
+		log.Fatal("Failed to register worker with coordinator")
+		return
+	}
 
 	for {
 		args := WorkerArgs{}
 		reply := WorkerReply{}
 
-		ok := call("Coordinator.GetWork", &args, &reply)
+		ok := worker.call("Coordinator.GetWork", &args, &reply)
 		if !ok {
 			// Coordinator has exited, so the job is done
 			return
@@ -162,7 +240,10 @@ func Worker(mapf func(string, string) []KeyValue,
 					TaskID:   reply.TaskID,
 				}
 				completeReply := WorkerReply{}
-				call("Coordinator.CompleteWork", &completeArgs, &completeReply)
+				worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply)
+
+				// add the completed map id to our list of local jobs
+				worker.mapIDs = append(worker.mapIDs, reply.TaskID)
 			}
 		case ReduceTask:
 			if err := handleReduce(reply, reducef); err == nil {
@@ -171,7 +252,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					TaskID:   reply.TaskID,
 				}
 				completeReply := WorkerReply{}
-				call("Coordinator.CompleteWork", &completeArgs, &completeReply)
+				worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply)
 			}
 		case WaitTask:
 			time.Sleep(500 * time.Millisecond)
@@ -181,14 +262,35 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
+// start a thread that listens for RPCs from other workers and coordinator
+func (worker *WorkerState) server() {
+	rpc.Register(worker)
+	rpc.HandleHTTP()
+	l, e := net.Listen("tcp", fmt.Sprintf(":%d", worker.servePort))
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	go http.Serve(l, nil)
+}
+
+func (worker *WorkerState) GetIntermediateFiles(args *IntermediateFileRequest, reply *IntermediateFileReply) error {
+
+	return nil
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+func (worker *WorkerState) call(rpcname string, args interface{}, reply interface{}) bool {
+	//sockname := coordinatorSock()
+	//c, err := rpc.DialHTTP("unix", sockname)
+	c, err := rpc.DialHTTP("tcp", worker.coordinatorAddress)
 	if err != nil {
 		// If coordinator has exited, dialing fails; return false so worker exits cleanly
+		// TODO: check for if the coordinator is actually down or properly completed
+		if !worker.registered {
+			log.Fatal("Failed to register worker with coordinator, check COORDINATOR_ADDRESS env var")
+		}
 		return false
 	}
 	defer c.Close()
