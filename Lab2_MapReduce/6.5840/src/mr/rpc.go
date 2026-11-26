@@ -33,10 +33,9 @@ type WorkerRegisterReply struct {
 }
 
 type FileLocation struct {
-	WorkerID  string
-	Address   string
-	Port      int
-	FileNames []string
+	WorkerID string
+	Address  string
+	Port     int
 }
 
 func (loc *FileLocation) FormatAddress() string {

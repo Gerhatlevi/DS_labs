@@ -26,10 +26,10 @@ const (
 )
 
 type WorkerData struct {
-	IpAddr            string
-	IpPort            int
-	ProgressRate      float64
-	IntermediateFiles []string
+	IpAddr       string
+	IpPort       int
+	ProgressRate float64
+	TaskIDs      []int
 }
 
 type Task struct {
@@ -60,6 +60,7 @@ func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegi
 	c.workers[uuid] = WorkerData{
 		IpAddr:       args.IpAddress,
 		IpPort:       args.Port,
+		TaskIDs:      []int{},
 		ProgressRate: 0,
 	}
 
@@ -74,8 +75,24 @@ func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegi
 // and the worker host is unreachable. This assumes that the worker has gone down and the work
 // that was completed on that node must then be recomputed.
 func (c *Coordinator) RecomputeWork(args *RecomputeWorkArgs, reply *RecomputeWorkReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// simply go through the tasks that were assigned for the reported worker that was unreachable
 	// and set those tasks to IDLE and let the coordinator go through the normal redistribution of work
+	// NOTE: we only need to recompute the map tasks here, reduce tasks will give the coordinator
+	//    back its final computed value so we don't care if the workerID is out of sync
+	foundJobsToRecompute := false
+	for i, task := range c.mapTasks {
+		if task.WorkerID == args.WorkerID {
+			c.mapTasks[i].Status = Idle
+			c.mapTasks[i].WorkerID = ""
+			foundJobsToRecompute = true
+		}
+	}
+	// if a worker requested this RPC, we should have found jobs to recompute here and assume that the
+	// workerID is no longer reachable, so clear this information from the database
+	reply.Success = foundJobsToRecompute
+	delete(c.workers, args.WorkerID)
 	return nil
 }
 
@@ -140,9 +157,8 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			for i, t := range c.mapTasks {
 				workerData := c.workers[t.WorkerID]
 				fileLocations[i] = FileLocation{
-					Address:   workerData.IpAddr,
-					Port:      workerData.IpPort,
-					FileNames: workerData.IntermediateFiles,
+					Address: workerData.IpAddr,
+					Port:    workerData.IpPort,
 				}
 			}
 			reply.FileLocations = fileLocations
