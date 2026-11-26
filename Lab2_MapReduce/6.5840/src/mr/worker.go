@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -26,6 +27,8 @@ type WorkerState struct {
 	coordinatorAddress string
 	registered         bool
 	uuid               string
+	straggleRate       int
+	jobDone            bool
 }
 
 // Map functions return a slice of KeyValue.
@@ -45,7 +48,7 @@ func getIP() string {
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 
-	return string(localAddr.IP)
+	return localAddr.IP.String()
 }
 
 // use ihash(key) % NReduce to choose the reduce
@@ -165,7 +168,7 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 		intermediateReply := IntermediateFileReply{
 			BufferedData: make(map[int][]byte),
 		}
-		if ok := worker.call("WorkerState.GetIntermediateFiles", &intermediateArgs, &intermediateReply, loc.FormatAddress()); ok {
+		if err := call("WorkerState.GetIntermediateFiles", &intermediateArgs, &intermediateReply, loc.FormatAddress()); err != nil {
 			for mapId, fileBytes := range intermediateReply.BufferedData {
 				// update the data from the other worker
 				intermediate[mapId] = updateKVPairs(bytes.NewReader(fileBytes), intermediate[mapId])
@@ -177,8 +180,8 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 			recomputeArgs := RecomputeWorkArgs{
 				WorkerID: workerId,
 			}
-			recomputeReply := RecomputeWorkReply{}
-			if ok := worker.call("Coordinator.RecomputeWork", &recomputeArgs, &recomputeReply, worker.coordinatorAddress); ok {
+			recomputeReply := SuccessReply{}
+			if err := call("Coordinator.RecomputeWork", &recomputeArgs, &recomputeReply, worker.coordinatorAddress); err != nil {
 				// NOTE: could do something here for if the coordinator reported a failure
 				log.Printf("Triggered Recompute Work for ID: %s, %t", workerId, recomputeReply.Success)
 			} else {
@@ -248,6 +251,7 @@ func initializeWorkerState() *WorkerState {
 			log.Fatal("WORKER_IP_ADDR is not a valid ipv4 address")
 		}
 	}
+
 	rpcEnvVar := os.Getenv("WORKER_RPC_PORT")
 	if rpcEnvVar == "" {
 		rpcEnvVar = DEFAULT_WORKER_RPC_PORT
@@ -262,11 +266,20 @@ func initializeWorkerState() *WorkerState {
 		log.Fatal("COORDINATOR_ADDRESS environment variable must be set and include port info like 'localhost:1234'")
 	}
 
+	straggleRate := 0
+	if straggleRateEnv := os.Getenv("STRAGGLE_RATE"); straggleRateEnv != "" {
+		if rate, err := strconv.Atoi(straggleRateEnv); err == nil {
+			straggleRate = rate
+		}
+	}
+
 	worker := WorkerState{
 		mapIDs:             []int{},
 		servePort:          servePort,
 		coordinatorAddress: coordinatorAddress,
 		registered:         false,
+		straggleRate:       straggleRate,
+		jobDone:            false,
 	}
 
 	// actually register this worker with the coordinator to get uuid information
@@ -275,12 +288,12 @@ func initializeWorkerState() *WorkerState {
 		Port:      servePort,
 	}
 	reply := WorkerRegisterReply{}
-	if ok := worker.call("Coordinator.RegisterWorker", &args, &reply, worker.coordinatorAddress); ok {
+	if err := call("Coordinator.RegisterWorker", &args, &reply, worker.coordinatorAddress); err == nil {
 		worker.registered = true
 		worker.uuid = reply.Uuid
 		log.Printf("Registered with UUID: %s", worker.uuid)
 	} else {
-		log.Fatal("Failed to register worker with coordinator")
+		log.Fatal("Failed to register worker with coordinator:", err)
 		return nil
 	}
 
@@ -296,13 +309,18 @@ func Worker(mapf func(string, string) []KeyValue,
 	worker.server()
 
 	for {
+		// introduce some straggle effect if configured
+		if worker.jobDone {
+			return
+		}
+		time.Sleep(time.Duration(worker.straggleRate) * time.Millisecond)
 		args := WorkerArgs{}
 		reply := WorkerReply{}
 
-		ok := worker.call("Coordinator.GetWork", &args, &reply, worker.coordinatorAddress)
-		if !ok {
-			// Coordinator has exited, so the job is done
-			return
+		if err := call("Coordinator.GetWork", &args, &reply, worker.coordinatorAddress); err != nil {
+			// assume that the coordinator will be restarted promptly at the same address
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
 		switch reply.TaskType {
@@ -319,7 +337,17 @@ func Worker(mapf func(string, string) []KeyValue,
 				worker.mu.Lock()
 				worker.mapIDs = append(worker.mapIDs, reply.TaskID)
 				worker.mu.Unlock()
-				worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress)
+
+				// keep trying to complete the work until we get a confirmation back from the coordinator
+				for {
+					if err := call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress); err == nil {
+						break
+					} else if strings.Contains(err.Error(), "connection refused") {
+						time.Sleep(1 * time.Second)
+					} else {
+						break
+					}
+				}
 			}
 		case ReduceTask:
 			if filename, err := worker.handleReduce(reply, reducef); err == nil {
@@ -331,7 +359,17 @@ func Worker(mapf func(string, string) []KeyValue,
 						ReduceTaskData: fileData,
 					}
 					completeReply := WorkerReply{}
-					worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress)
+
+					// keep trying to complete the work until we get a confirmation back from the coordinator
+					for {
+						if err := call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress); err == nil {
+							break
+						} else if strings.Contains(err.Error(), "connection refused") {
+							time.Sleep(1 * time.Second)
+						} else {
+							break
+						}
+					}
 				}
 			}
 		case WaitTask:
@@ -371,28 +409,28 @@ func (worker *WorkerState) GetIntermediateFiles(args *IntermediateFileArgs, repl
 	return nil
 }
 
+// RPC sent via the coordinator to gracefully terminate all current active workers.
+// Calls TerminateJob to notify this Worker that it can stop working because the main
+// job has completed. The Worker should continue working until it hears this message
+// from the Coordinator so it can distinguish between a Coordinator failure and completion
+func (worker *WorkerState) TerminateJob(args *EmptyArgs, reply *SuccessReply) error {
+	worker.jobDone = true
+	reply.Success = true
+	return nil
+}
+
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-func (worker *WorkerState) call(rpcname string, args interface{}, reply interface{}, addr string) bool {
+func call(rpcname string, args interface{}, reply interface{}, addr string) error {
 	//sockname := coordinatorSock()
 	//c, err := rpc.DialHTTP("unix", sockname)
 	c, err := rpc.DialHTTP("tcp", addr)
 	if err != nil {
-		// If coordinator has exited, dialing fails; return false so worker exits cleanly
-		// TODO: check for if the coordinator is actually down or properly completed
-		if !worker.registered {
-			log.Fatal("Failed to register worker with coordinator, check COORDINATOR_ADDRESS env var")
-		}
-		return false
+		return err
 	}
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+	return err
 }

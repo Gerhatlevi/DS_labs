@@ -80,7 +80,10 @@ type RecomputeWorkArgs struct {
 	WorkerID string
 }
 
-type RecomputeWorkReply struct {
+type EmptyArgs struct {
+}
+
+type SuccessReply struct {
 	Success bool
 }
 
