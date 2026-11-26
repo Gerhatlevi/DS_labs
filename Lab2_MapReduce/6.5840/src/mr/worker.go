@@ -178,7 +178,6 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 				WorkerID: workerId,
 			}
 			recomputeReply := RecomputeWorkReply{}
-			log.Panic("What")
 			if ok := worker.call("Coordinator.RecomputeWork", &recomputeArgs, &recomputeReply, worker.coordinatorAddress); ok {
 				// NOTE: could do something here for if the coordinator reported a failure
 				log.Printf("Triggered Recompute Work for ID: %s, %t", workerId, recomputeReply.Success)
