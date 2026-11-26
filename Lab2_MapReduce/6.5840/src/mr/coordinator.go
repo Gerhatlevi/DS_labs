@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 )
 
 const DEFAULT_COORDINATOR_RPC_PORT = "1234"
+const SNAPSHOT_FREQUENCY_SECONDS = 2
 
 type TaskStatus int
 
@@ -32,6 +34,10 @@ type WorkerData struct {
 	TaskIDs      []int
 }
 
+func (w *WorkerData) FormatAddress() string {
+	return fmt.Sprintf("%s:%d", w.IpAddr, w.IpPort)
+}
+
 type Task struct {
 	Status    TaskStatus
 	FileName  string // only for map tasks
@@ -42,14 +48,54 @@ type Task struct {
 type Coordinator struct {
 	// since every RPC is a different goroutine we have to make sure at one given time only 1 R/W the tasks arrays
 	mu                   sync.Mutex
-	workers              map[string]WorkerData
-	mapTasks             []Task
-	reduceTasks          []Task
-	completedReduceCount int
-	nMap                 int
-	nReduce              int
-	allDone              bool
-	servePort            int
+	Workers              map[string]WorkerData
+	MapTasks             []Task
+	ReduceTasks          []Task
+	CompletedReduceCount int
+	NumMap               int
+	NumReduce            int
+	AllDone              bool
+	ServePort            int
+}
+
+const coordinatorCheckpointFile = "Coordinator.checkpoint"
+
+// SaveCoordinatorCheckpoint is used for periodically writing the Coordinator state c to disk
+// which can then be used in LoadCoordinatorCheckpoint for loading from checkpoint. The format
+// of the data is just simply writing to json data since the object can be easily marshaled to JSON
+func (c *Coordinator) SaveCoordinatorCheckpoint() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	log.Print("Checkpointing the Coordinator State")
+	// NOTE: it's okay that we rewrite this file because we need to update the entire object
+	checkpointFile, err := os.Create(coordinatorCheckpointFile)
+	if err != nil {
+		return err
+	}
+
+	encoder := json.NewEncoder(checkpointFile)
+	if err := encoder.Encode(c); err != nil {
+		return err
+	}
+
+	checkpointFile.Close()
+	return nil
+}
+
+func (c *Coordinator) LoadCoordinatorCheckpoint() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	checkpointFile, err := os.Open(coordinatorCheckpointFile)
+	if err != nil {
+		return err
+	}
+
+	encoder := json.NewDecoder(checkpointFile)
+	encoder.Decode(c)
+
+	return nil
 }
 
 func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegisterReply) error {
@@ -57,7 +103,7 @@ func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegi
 	defer c.mu.Unlock()
 
 	uuid := uuid.New().String()
-	c.workers[uuid] = WorkerData{
+	c.Workers[uuid] = WorkerData{
 		IpAddr:       args.IpAddress,
 		IpPort:       args.Port,
 		TaskIDs:      []int{},
@@ -74,7 +120,7 @@ func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegi
 // particularly for the reduce phase when a worker needs to collect the intermediate data files
 // and the worker host is unreachable. This assumes that the worker has gone down and the work
 // that was completed on that node must then be recomputed.
-func (c *Coordinator) RecomputeWork(args *RecomputeWorkArgs, reply *RecomputeWorkReply) error {
+func (c *Coordinator) RecomputeWork(args *RecomputeWorkArgs, reply *SuccessReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// simply go through the tasks that were assigned for the reported worker that was unreachable
@@ -82,28 +128,32 @@ func (c *Coordinator) RecomputeWork(args *RecomputeWorkArgs, reply *RecomputeWor
 	// NOTE: we only need to recompute the map tasks here, reduce tasks will give the coordinator
 	//    back its final computed value so we don't care if the workerID is out of sync
 	foundJobsToRecompute := false
-	for i, task := range c.mapTasks {
+	for i, task := range c.MapTasks {
 		if task.WorkerID == args.WorkerID {
-			c.mapTasks[i].Status = Idle
-			c.mapTasks[i].WorkerID = ""
+			c.MapTasks[i].Status = Idle
+			c.MapTasks[i].WorkerID = ""
 			foundJobsToRecompute = true
 		}
 	}
 	// if a worker requested this RPC, we should have found jobs to recompute here and assume that the
 	// workerID is no longer reachable, so clear this information from the database
 	reply.Success = foundJobsToRecompute
-	delete(c.workers, args.WorkerID)
+	delete(c.Workers, args.WorkerID)
 	return nil
 }
 
+// GetWork is used as the primary RPC call for workers to get either Map or Reduce jobs based on
+// the current distribution of work. If all of the Map jobs have been given out and completed, then
+// the coordinator manages sending out Reduce jobs. Once all jobs are completed, the Coordinator
+// will have all of the final reduce jobs and the MapReduce job is complete.
 func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// check if we have any map jobs first that need to be completed
 	allMapsDone := true
-	for i := range c.mapTasks {
-		mapTask := &c.mapTasks[i]
+	for i := range c.MapTasks {
+		mapTask := &c.MapTasks[i]
 		if mapTask.Status != Completed {
 			allMapsDone = false
 		}
@@ -121,9 +171,9 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			// corpus files since that is how MapReduce is implemented in the paper
 			// where input files reside locally and the coordinator schedules jobs
 			// based on that knowledge of where these input files live
-			reply.FileName = c.mapTasks[i].FileName
-			reply.NReduce = c.nReduce
-			reply.NMap = c.nMap
+			reply.FileName = c.MapTasks[i].FileName
+			reply.NReduce = c.NumReduce
+			reply.NMap = c.NumMap
 			return nil
 		}
 	}
@@ -136,8 +186,8 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 
 	// start giving out the reduce jobs since we know the map stage is complete
 	allReducesDone := true
-	for i := range c.reduceTasks {
-		reduceTask := &c.reduceTasks[i]
+	for i := range c.ReduceTasks {
+		reduceTask := &c.ReduceTasks[i]
 		if reduceTask.Status != Completed {
 			allReducesDone = false
 		}
@@ -150,12 +200,12 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 
 			reply.TaskType = ReduceTask
 			reply.TaskID = i
-			reply.NMap = c.nMap
+			reply.NMap = c.NumMap
 
 			// send the file locations to this reduce task to collect intermediate data
 			fileLocations := make(map[int]FileLocation)
-			for i, t := range c.mapTasks {
-				workerData := c.workers[t.WorkerID]
+			for i, t := range c.MapTasks {
+				workerData := c.Workers[t.WorkerID]
 				fileLocations[i] = FileLocation{
 					Address:  workerData.IpAddr,
 					Port:     workerData.IpPort,
@@ -173,7 +223,7 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 		return nil
 	}
 
-	c.allDone = true
+	c.AllDone = true
 	reply.TaskType = ExitTask
 	return nil
 }
@@ -199,9 +249,9 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 	switch args.TaskType {
 	// need to check because it can happen that slower tasks finished after a faster completed that beforehand
 	case MapTask:
-		task = &c.mapTasks[args.TaskID]
+		task = &c.MapTasks[args.TaskID]
 	case ReduceTask:
-		task = &c.reduceTasks[args.TaskID]
+		task = &c.ReduceTasks[args.TaskID]
 		taskName = "Reduce"
 	default:
 		return errors.New("task type not supported")
@@ -239,12 +289,12 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 			return err
 		}
 
-		c.completedReduceCount += 1
+		c.CompletedReduceCount += 1
 	}
 
 	// check if this was the last reduce task we were waiting on
-	if c.completedReduceCount == len(c.reduceTasks) {
-		c.allDone = true
+	if c.CompletedReduceCount == len(c.ReduceTasks) {
+		c.AllDone = true
 	}
 
 	return nil
@@ -257,7 +307,7 @@ func (c *Coordinator) server() {
 	//sockname := coordinatorSock()
 	//os.Remove(sockname)
 	//l, e := net.Listen("unix", sockname)
-	l, e := net.Listen("tcp", fmt.Sprintf(":%d", c.servePort))
+	l, e := net.Listen("tcp", fmt.Sprintf(":%d", c.ServePort))
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -269,7 +319,14 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.allDone
+	if c.AllDone {
+		// attempt to notify all workers that we are done
+		// just send and don't care if we got any errors
+		for _, worker := range c.Workers {
+			call("WorkerState.TerminateJob", &EmptyArgs{}, &SuccessReply{}, worker.FormatAddress())
+		}
+	}
+	return c.AllDone
 }
 
 // create a Coordinator.
@@ -288,29 +345,44 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c := Coordinator{
-		workers:              make(map[string]WorkerData),
-		mapTasks:             make([]Task, len(files)),
-		reduceTasks:          make([]Task, nReduce),
-		completedReduceCount: 0,
-		nMap:                 len(files),
-		nReduce:              nReduce,
-		allDone:              false,
-		servePort:            servePort,
+		Workers:              make(map[string]WorkerData),
+		MapTasks:             make([]Task, len(files)),
+		ReduceTasks:          make([]Task, nReduce),
+		CompletedReduceCount: 0,
+		NumMap:               len(files),
+		NumReduce:            nReduce,
+		AllDone:              false,
+		ServePort:            servePort,
 	}
 
-	for i, file := range files {
-		c.mapTasks[i] = Task{
-			Status:   Idle,
-			FileName: file,
+	// attempt to load the coordinator state from disk
+	if err := c.LoadCoordinatorCheckpoint(); err != nil {
+		log.Printf("Failed to load coordinator state: %s", err)
+		for i, file := range files {
+			c.MapTasks[i] = Task{
+				Status:   Idle,
+				FileName: file,
+			}
+		}
+
+		for i := 0; i < nReduce; i++ {
+			c.ReduceTasks[i] = Task{
+				Status: Idle,
+			}
 		}
 	}
 
-	for i := 0; i < nReduce; i++ {
-		c.reduceTasks[i] = Task{
-			Status: Idle,
+	// spin off a go routine to handle periodic checkpointing of the coordinator
+	go func(c *Coordinator) {
+		for {
+			time.Sleep(SNAPSHOT_FREQUENCY_SECONDS * time.Second)
+			if err := c.SaveCoordinatorCheckpoint(); err != nil {
+				log.Printf("Failed to save checkpoint: %s", err)
+			}
 		}
-	}
+	}(&c)
 
+	// start the RPC server for the coordinator
 	c.server()
 	return &c
 }
