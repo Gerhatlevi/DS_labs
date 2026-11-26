@@ -162,8 +162,10 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 		intermediateArgs := IntermediateFileArgs{
 			ReduceID: reply.TaskID,
 		}
-		intermediateReply := IntermediateFileReply{}
-		if ok := worker.call("Worker.GetIntermediateFiles", &intermediateArgs, &intermediateReply, loc.FormatAddress()); ok {
+		intermediateReply := IntermediateFileReply{
+			BufferedData: make(map[int][]byte),
+		}
+		if ok := worker.call("WorkerState.GetIntermediateFiles", &intermediateArgs, &intermediateReply, loc.FormatAddress()); ok {
 			for mapId, fileBytes := range intermediateReply.BufferedData {
 				// update the data from the other worker
 				intermediate[mapId] = updateKVPairs(bytes.NewReader(fileBytes), intermediate[mapId])
@@ -176,6 +178,7 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 				WorkerID: workerId,
 			}
 			recomputeReply := RecomputeWorkReply{}
+			log.Panic("What")
 			if ok := worker.call("Coordinator.RecomputeWork", &recomputeArgs, &recomputeReply, worker.coordinatorAddress); ok {
 				// NOTE: could do something here for if the coordinator reported a failure
 				log.Printf("Triggered Recompute Work for ID: %s, %t", workerId, recomputeReply.Success)
@@ -312,10 +315,12 @@ func Worker(mapf func(string, string) []KeyValue,
 					WorkerID: worker.uuid,
 				}
 				completeReply := WorkerReply{}
-				worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress)
 
 				// add the completed map id to our list of local jobs
+				worker.mu.Lock()
 				worker.mapIDs = append(worker.mapIDs, reply.TaskID)
+				worker.mu.Unlock()
+				worker.call("Coordinator.CompleteWork", &completeArgs, &completeReply, worker.coordinatorAddress)
 			}
 		case ReduceTask:
 			if filename, err := worker.handleReduce(reply, reducef); err == nil {
@@ -352,8 +357,12 @@ func (worker *WorkerState) server() {
 // GetIntermediateFiles looks up the local intermediate files that were computed as part of the map task ran on
 // this worker and reads the file and returns the data.
 func (worker *WorkerState) GetIntermediateFiles(args *IntermediateFileArgs, reply *IntermediateFileReply) error {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+
 	// read all of the files associated with this reduce task
-	for mapId := range worker.mapIDs {
+	reply.BufferedData = make(map[int][]byte)
+	for _, mapId := range worker.mapIDs {
 		if content, err := readFile(fmt.Sprintf("mr-%d-%d", mapId, args.ReduceID)); err == nil {
 			reply.BufferedData[mapId] = content
 		} else {

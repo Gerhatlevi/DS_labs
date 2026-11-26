@@ -157,8 +157,9 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 			for i, t := range c.mapTasks {
 				workerData := c.workers[t.WorkerID]
 				fileLocations[i] = FileLocation{
-					Address: workerData.IpAddr,
-					Port:    workerData.IpPort,
+					Address:  workerData.IpAddr,
+					Port:     workerData.IpPort,
+					WorkerID: t.WorkerID,
 				}
 			}
 			reply.FileLocations = fileLocations
@@ -194,12 +195,14 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 	defer c.mu.Unlock()
 
 	var task *Task
+	taskName := "Map"
 	switch args.TaskType {
 	// need to check because it can happen that slower tasks finished after a faster completed that beforehand
 	case MapTask:
 		task = &c.mapTasks[args.TaskID]
 	case ReduceTask:
 		task = &c.reduceTasks[args.TaskID]
+		taskName = "Reduce"
 	default:
 		return errors.New("task type not supported")
 	}
@@ -213,6 +216,8 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 		log.Print(err)
 		return err
 	}
+
+	log.Printf("Completed %s Task %d for ID: %s", taskName, args.TaskID, args.WorkerID)
 
 	// update the task with the worker id that completed the work.
 	// it should usually be the one that was initially assigned, but we sometimes kick
