@@ -19,6 +19,16 @@ import (
 const DEFAULT_COORDINATOR_RPC_PORT = "1234"
 const SNAPSHOT_FREQUENCY_SECONDS = 2
 
+// **************************
+// LATE scheduler parameters
+// **************************
+
+// Collected by using a threshold of STRAGGLE_RATE=100
+const SlowNodeThreshold = 0.001
+
+// Task should be completed longer than 500 ms
+const SlowTaskThreshold = 500
+
 type TaskStatus int
 
 const (
@@ -28,10 +38,12 @@ const (
 )
 
 type WorkerData struct {
-	IpAddr       string
-	IpPort       int
-	ProgressRate float64
-	TaskIDs      []int
+	IpAddr              string
+	IpPort              int
+	WorkerID            string
+	AverageProgressRate float64
+	MapTaskIDs          map[int]struct{}
+	ReduceTaskIDs       map[int]struct{}
 }
 
 func (w *WorkerData) FormatAddress() string {
@@ -39,10 +51,14 @@ func (w *WorkerData) FormatAddress() string {
 }
 
 type Task struct {
-	Status    TaskStatus
-	FileName  string // only for map tasks
-	WorkerID  string
-	StartTime time.Time
+	Status                 TaskStatus
+	FileName               string // only for map tasks
+	TaskID                 int
+	WorkerID               string
+	ProgressScore          float64
+	ProgressRate           float64
+	TimeToCompletionMillis float64
+	StartTime              time.Time
 }
 
 type Coordinator struct {
@@ -56,9 +72,36 @@ type Coordinator struct {
 	NumReduce            int
 	AllDone              bool
 	ServePort            int
+	UseLATE              bool
 }
 
 const coordinatorCheckpointFile = "Coordinator.checkpoint"
+
+// Helper function to calculate the average progress rate for a particular worker
+// and returns that average. To be used in LATE scheduler calculations.
+func computeAverageProgressRate(c *Coordinator, worker *WorkerData) float64 {
+	averageProgressRate := 0.0
+	totalJobs := 0.0
+	for mapTaskID := range worker.MapTaskIDs {
+		totalJobs += 1
+		// only count these jobs if they didn't get co-opted by a speculative job
+		if c.MapTasks[mapTaskID].WorkerID == worker.WorkerID {
+			averageProgressRate += c.MapTasks[mapTaskID].ProgressRate
+		}
+	}
+	for reduceTaskID := range worker.ReduceTaskIDs {
+		totalJobs += 1
+		// only count these jobs if they didn't get co-opted by a speculative job
+		if c.ReduceTasks[reduceTaskID].WorkerID == worker.WorkerID {
+			averageProgressRate += c.ReduceTasks[reduceTaskID].ProgressRate
+		}
+	}
+
+	if totalJobs > 0 {
+		return averageProgressRate / totalJobs
+	}
+	return 0
+}
 
 // SaveCoordinatorCheckpoint is used for periodically writing the Coordinator state c to disk
 // which can then be used in LoadCoordinatorCheckpoint for loading from checkpoint. The format
@@ -67,7 +110,7 @@ func (c *Coordinator) SaveCoordinatorCheckpoint() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	log.Print("Checkpointing the Coordinator State")
+	//log.Print("Checkpointing the Coordinator State")
 	// NOTE: it's okay that we rewrite this file because we need to update the entire object
 	checkpointFile, err := os.Create(coordinatorCheckpointFile)
 	if err != nil {
@@ -83,6 +126,8 @@ func (c *Coordinator) SaveCoordinatorCheckpoint() error {
 	return nil
 }
 
+// Simple function that loads from the checkpointed JSON encoded Coordinator
+// state file that was created during SaveCoordinatorCheckpoint.
 func (c *Coordinator) LoadCoordinatorCheckpoint() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -98,21 +143,26 @@ func (c *Coordinator) LoadCoordinatorCheckpoint() error {
 	return nil
 }
 
+// RegisterWorker is an RPC call that should be the first thing a Worker does to communicate
+// with the Coordinator and provide location information (IpAddr and IpPort) so that downstream
+// reduce jobs can lookup and fetch intermediate files from each other.
 func (c *Coordinator) RegisterWorker(args *WorkerRegisterArgs, reply *WorkerRegisterReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	uuid := uuid.New().String()
 	c.Workers[uuid] = WorkerData{
-		IpAddr:       args.IpAddress,
-		IpPort:       args.Port,
-		TaskIDs:      []int{},
-		ProgressRate: 0,
+		IpAddr:              args.IpAddress,
+		IpPort:              args.Port,
+		WorkerID:            uuid,
+		MapTaskIDs:          make(map[int]struct{}),
+		ReduceTaskIDs:       make(map[int]struct{}),
+		AverageProgressRate: 0,
 	}
 
 	// worker should use this uuid for reporting status information
-	reply.Uuid = uuid
-	log.Printf("new uuid: %s, ip: %s, port: %d", uuid, args.IpAddress, args.Port)
+	reply.WorkerID = uuid
+	log.Printf("new uuid: %s, ip: %s, port: %d", uuid, c.Workers[uuid].IpAddr, c.Workers[uuid].IpPort)
 	return nil
 }
 
@@ -142,6 +192,98 @@ func (c *Coordinator) RecomputeWork(args *RecomputeWorkArgs, reply *SuccessReply
 	return nil
 }
 
+// UpdateTaskStatus is used for Workers to periodically report their progress score
+// back to the coordinator so the coordinator can make a decision about kicking off speculative work.
+// If the worker reporting status is not the current one assigned to the job
+// or if the task has already been reported complete by another job, then the information is
+// just ignored.
+func (c *Coordinator) UpdateTaskStatus(args *StatusUpdateArgs, reply *SuccessReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var task *Task
+	switch args.TaskType {
+	case MapTask:
+		if args.TaskID >= 0 && args.TaskID < len(c.MapTasks) {
+			task = &c.MapTasks[args.TaskID]
+		} else {
+			reply.Success = false
+			return errors.New("Invalid TaskID provided")
+		}
+	case ReduceTask:
+		if args.TaskID >= 0 && args.TaskID < len(c.ReduceTasks) {
+			task = &c.ReduceTasks[args.TaskID]
+		} else {
+			reply.Success = false
+			return errors.New("Invalid TaskID provided")
+		}
+	default:
+		reply.Success = false
+		return errors.New("Invalid TaskType reported")
+	}
+
+	// only update the statistics for this task if the worker is still assigned to this task
+	if task.WorkerID != args.WorkerID {
+		reply.Success = false
+		return errors.New("Job WorkerID does not match")
+	}
+	reply.Success = true
+
+	// update the heuristics for this task based on the LATE scheduler:
+	// We estimate the progress rate of each task as ProgressScore/T, where T
+	// is the amount of time the task has been running for, and then estimate the time to completion as
+	// (1 − ProgressScore)/ProgressRate. This assumes that tasks make progress at a roughly constant rate.
+	//
+	// This information will be used in scheduling speculative jobs in the GetWork function
+	task.ProgressScore = args.ProgressScore
+	task.ProgressRate = task.ProgressScore / float64(time.Since(task.StartTime).Milliseconds())
+	task.TimeToCompletionMillis = (1 - task.ProgressScore) / task.ProgressRate
+
+	// also update the worker average progress rate
+	worker := c.Workers[args.WorkerID]
+	worker.AverageProgressRate = computeAverageProgressRate(c, &worker)
+	c.Workers[args.WorkerID] = worker
+	return nil
+}
+
+func (c *Coordinator) startTask(task *Task, reply *WorkerReply, workerID string, taskType TaskType) {
+	task.Status = InProgress
+	task.WorkerID = workerID
+	task.StartTime = time.Now()
+	// add this task id to the worker MapTasks for lookup and calculations later
+	switch taskType {
+	case MapTask:
+		c.Workers[workerID].MapTaskIDs[task.TaskID] = struct{}{}
+	case ReduceTask:
+		c.Workers[workerID].ReduceTaskIDs[task.TaskID] = struct{}{}
+	}
+
+	// update the reply to the correct data for the worker job
+	reply.TaskType = taskType
+	reply.TaskID = task.TaskID
+
+	// NOTE: we assume that all workers also have local access to the input
+	// corpus files since that is how MapReduce is implemented in the paper
+	// where input files reside locally and the coordinator schedules jobs
+	// based on that knowledge of where these input files live
+	reply.FileName = task.FileName
+	reply.NReduce = c.NumReduce
+	reply.NMap = c.NumMap
+}
+
+// Used for trying to kick off a speculative job. The worker node must be considered a "fast node"
+// or rather not a "straggler" which is defined here by if the AverageProgressRate is
+// greater than our slow node threshold. Then the task must be in progress and the time
+// to completion must meet our criteria for being worth recomputing based on the SlowTaskThreshold.
+func (c *Coordinator) shouldStartSpeculative(task *Task, workerID string) bool {
+	if c.UseLATE && c.Workers[workerID].AverageProgressRate > SlowNodeThreshold {
+		if task.Status == InProgress && task.TimeToCompletionMillis > SlowTaskThreshold {
+			return true
+		}
+	}
+	return false
+}
+
 // GetWork is used as the primary RPC call for workers to get either Map or Reduce jobs based on
 // the current distribution of work. If all of the Map jobs have been given out and completed, then
 // the coordinator manages sending out Reduce jobs. Once all jobs are completed, the Coordinator
@@ -150,57 +292,68 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// ********************************************
+	// ***************** MAP PHASE ****************
+	// ********************************************
 	// check if we have any map jobs first that need to be completed
 	allMapsDone := true
+	longestEstimatedTask := &c.MapTasks[0]
 	for i := range c.MapTasks {
 		mapTask := &c.MapTasks[i]
 		if mapTask.Status != Completed {
 			allMapsDone = false
 		}
+
+		// used to collect the longest estimated task for speculation later if all tasks are currently running
+		if c.UseLATE && mapTask.Status == InProgress && mapTask.TimeToCompletionMillis > longestEstimatedTask.TimeToCompletionMillis {
+			longestEstimatedTask = mapTask
+		}
+
 		if mapTask.Status == Idle ||
-			(mapTask.Status == InProgress && time.Since(mapTask.StartTime) > 10*time.Second) {
-
-			mapTask.Status = InProgress
-			mapTask.WorkerID = args.WorkerID
-			mapTask.StartTime = time.Now()
-
-			// update the reply to the correct data for the worker job
-			reply.TaskType = MapTask
-			reply.TaskID = i
-			// NOTE: we assume that all workers also have local access to the input
-			// corpus files since that is how MapReduce is implemented in the paper
-			// where input files reside locally and the coordinator schedules jobs
-			// based on that knowledge of where these input files live
-			reply.FileName = c.MapTasks[i].FileName
-			reply.NReduce = c.NumReduce
-			reply.NMap = c.NumMap
+			// backup jobs if it took longer than 10 seconds by default
+			(!c.UseLATE && mapTask.Status == InProgress && time.Since(mapTask.StartTime) > 10*time.Second) {
+			if mapTask.Status == InProgress {
+				log.Printf("Kicking off a backup job for MapTask: %d", mapTask.TaskID)
+			}
+			c.startTask(mapTask, reply, args.WorkerID, MapTask)
 			return nil
 		}
 	}
 
 	// make the worker wait if we are still working on the map phase
 	if !allMapsDone {
-		reply.TaskType = WaitTask
+		if c.shouldStartSpeculative(longestEstimatedTask, args.WorkerID) {
+			log.Printf("Kicking off a speculative job for MapTask: %d", longestEstimatedTask.TaskID)
+			c.startTask(longestEstimatedTask, reply, args.WorkerID, MapTask)
+		} else {
+			reply.TaskType = WaitTask
+		}
 		return nil
 	}
 
+	// ********************************************
+	// ************** REDUCE PHASE ****************
+	// ********************************************
 	// start giving out the reduce jobs since we know the map stage is complete
 	allReducesDone := true
+	longestEstimatedTask = &c.ReduceTasks[0]
 	for i := range c.ReduceTasks {
 		reduceTask := &c.ReduceTasks[i]
 		if reduceTask.Status != Completed {
 			allReducesDone = false
 		}
+
+		// used to collect the longest estimated task for speculation later if all tasks are currently running
+		if c.UseLATE && reduceTask.Status == InProgress && reduceTask.TimeToCompletionMillis > longestEstimatedTask.TimeToCompletionMillis {
+			longestEstimatedTask = reduceTask
+		}
+
 		if reduceTask.Status == Idle ||
-			(reduceTask.Status == InProgress && time.Since(reduceTask.StartTime) > 10*time.Second) {
-
-			reduceTask.Status = InProgress
-			reduceTask.WorkerID = args.WorkerID
-			reduceTask.StartTime = time.Now()
-
-			reply.TaskType = ReduceTask
-			reply.TaskID = i
-			reply.NMap = c.NumMap
+			(!c.UseLATE && reduceTask.Status == InProgress && time.Since(reduceTask.StartTime) > 10*time.Second) {
+			if reduceTask.Status == InProgress {
+				log.Printf("Kicking off a backup job for ReduceTask: %d", reduceTask.TaskID)
+			}
+			c.startTask(reduceTask, reply, args.WorkerID, ReduceTask)
 
 			// send the file locations to this reduce task to collect intermediate data
 			fileLocations := make(map[int]FileLocation)
@@ -219,7 +372,16 @@ func (c *Coordinator) GetWork(args *WorkerArgs, reply *WorkerReply) error {
 
 	// make the worker wait in case we need to kick off a backup job for a slow or failed reduce worker
 	if !allReducesDone {
-		reply.TaskType = WaitTask
+		// try to kick off a speculative job. The worker node must be considered a "fast node"
+		// or rather not a "straggler" which is defined here by if the AverageProgressRate is
+		// greater than our slow node threshold. Then the task must be in progress and the time
+		// to completion must meet our criteria for being worth recomputing based on the SlowTaskThreshold.
+		if c.shouldStartSpeculative(longestEstimatedTask, args.WorkerID) {
+			log.Printf("Kicking off a speculative job for ReduceTask: %d ", longestEstimatedTask.TaskID)
+			c.startTask(longestEstimatedTask, reply, args.WorkerID, ReduceTask)
+		} else {
+			reply.TaskType = WaitTask
+		}
 		return nil
 	}
 
@@ -267,7 +429,7 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 		return err
 	}
 
-	log.Printf("Completed %s Task %d for ID: %s", taskName, args.TaskID, args.WorkerID)
+	log.Printf("Completed %s Task %d for ID: %s\nTask Progress Rate: %f, Worker Progress Rate: %f", taskName, args.TaskID, args.WorkerID, task.ProgressRate, c.Workers[args.WorkerID].AverageProgressRate)
 
 	// update the task with the worker id that completed the work.
 	// it should usually be the one that was initially assigned, but we sometimes kick
@@ -295,6 +457,11 @@ func (c *Coordinator) CompleteWork(args *WorkerArgs, reply *WorkerReply) error {
 	// check if this was the last reduce task we were waiting on
 	if c.CompletedReduceCount == len(c.ReduceTasks) {
 		c.AllDone = true
+	} else {
+		// update this worker's average progress rate
+		worker := c.Workers[args.WorkerID]
+		worker.AverageProgressRate = computeAverageProgressRate(c, &worker)
+		c.Workers[args.WorkerID] = worker
 	}
 
 	return nil
@@ -333,8 +500,6 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	// TODO: also keep track here for connections to tell other workers
-	// where to go to collect intermediate jobs
 	rpcEnvVar := os.Getenv("RPC_PORT")
 	if rpcEnvVar == "" {
 		rpcEnvVar = DEFAULT_COORDINATOR_RPC_PORT
@@ -342,6 +507,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	servePort, err := strconv.Atoi(rpcEnvVar)
 	if err != nil {
 		log.Fatal("failed to parse environment var RPC_PORT, should be valid port example: RPC_PORT=1234")
+	}
+
+	useLATE := false
+	if useLATEEnv := os.Getenv("USE_LATE"); useLATEEnv != "" {
+		log.Print("Using the LATE scheduler")
+		useLATE = true
 	}
 
 	c := Coordinator{
@@ -353,6 +524,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		NumReduce:            nReduce,
 		AllDone:              false,
 		ServePort:            servePort,
+		UseLATE:              useLATE,
 	}
 
 	// attempt to load the coordinator state from disk
@@ -360,14 +532,20 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		log.Printf("Failed to load coordinator state: %s", err)
 		for i, file := range files {
 			c.MapTasks[i] = Task{
-				Status:   Idle,
-				FileName: file,
+				Status:        Idle,
+				FileName:      file,
+				TaskID:        i,
+				ProgressScore: 0,
+				ProgressRate:  0,
 			}
 		}
 
 		for i := 0; i < nReduce; i++ {
 			c.ReduceTasks[i] = Task{
-				Status: Idle,
+				Status:        Idle,
+				TaskID:        i,
+				ProgressScore: 0,
+				ProgressRate:  0,
 			}
 		}
 	}

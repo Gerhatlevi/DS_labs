@@ -3,6 +3,7 @@ package mr
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -73,15 +74,56 @@ func readFile(fileName string) ([]byte, error) {
 	return content, err
 }
 
+// straggle is a helper function to help simulate a linear straggle rate for this
+// worker which can be set via the STRAGGLE_RATE environment variable
+func (worker *WorkerState) straggle() {
+	time.Sleep(time.Duration(worker.straggleRate) * time.Millisecond)
+}
+
+// sendStatusUpdate is a wrapper function used for communicating status to the coordinator
+// based on the progressScore value which should be calculated relatively close to the LATE
+// scheduler paper.
+func (worker *WorkerState) sendStatusUpdate(progressScore float64, taskType TaskType, taskID int) error {
+	statusUpdateArgs := StatusUpdateArgs{
+		WorkerID:      worker.uuid,
+		TaskType:      taskType,
+		TaskID:        taskID,
+		ProgressScore: progressScore,
+	}
+	reply := SuccessReply{}
+	if err := call("Coordinator.UpdateTaskStatus", &statusUpdateArgs, &reply, worker.coordinatorAddress); err == nil {
+		return nil
+	} else if strings.Contains(err.Error(), "connection refused") {
+		// if we failed to connect to the server, then we don't care. No need to retry sending status
+		return nil
+	} else {
+		return err
+	}
+}
+
 func (worker *WorkerState) handleMap(reply WorkerReply, mapf func(string, string) []KeyValue) error {
+	progressScore := 0.0
+	worker.sendStatusUpdate(progressScore, MapTask, reply.TaskID)
 	content, err := readFile(reply.FileName)
+
+	// we will say reading in the file will report some fixed status amount
+	progressScore = 0.25
+	worker.sendStatusUpdate(progressScore, MapTask, reply.TaskID)
+
 	if err != nil {
 		// NOTE: we assume here that the input file is on the local disk to reduce network
 		// bandwidth in sending the entire large corpus file at the beginning
 		log.Fatal("File is not found on local disk")
 	}
 
+	// introduce some additional straggle effect here
+	worker.straggle()
+
 	mapResults := mapf(reply.FileName, string(content))
+
+	// we can't introspect the mapf so we have to just report the score after it's done
+	progressScore = 0.5
+	worker.sendStatusUpdate(progressScore, MapTask, reply.TaskID)
 
 	// Create nReduce temporary files for consistency
 	tmpFiles := make([]*os.File, reply.NReduce)
@@ -101,10 +143,22 @@ func (worker *WorkerState) handleMap(reply WorkerReply, mapf func(string, string
 	}
 
 	// Partition KeyValue pairs into buckets same keys get into the same bucket
-	for _, kv := range mapResults {
+	reportRate := 5000
+	reportCounter := 0
+	numResults := float64(len(mapResults))
+	for i, kv := range mapResults {
 		bucket := ihash(kv.Key) % reply.NReduce
 		if err := encoders[bucket].Encode(&kv); err != nil {
 			return err
+		}
+
+		// report back to the coordinator for every reportRate intervals
+		reportCounter = (reportCounter + 1) % reportRate
+		if reportCounter == 0 {
+			// cap the max progress for this section to be 0.95 so the final renaming section takes
+			// the final 0.1 of the progress.
+			worker.sendStatusUpdate(progressScore+(float64(i)/numResults)*0.45, MapTask, reply.TaskID)
+			worker.straggle()
 		}
 	}
 
@@ -120,6 +174,10 @@ func (worker *WorkerState) handleMap(reply WorkerReply, mapf func(string, string
 			return err
 		}
 	}
+
+	// report the final progress back to the coordinator
+	progressScore = 1.0
+	worker.sendStatusUpdate(progressScore, MapTask, reply.TaskID)
 
 	return nil
 }
@@ -138,6 +196,7 @@ func updateKVPairs(reader io.Reader, intermediate []KeyValue) []KeyValue {
 }
 
 func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, []string) string) (string, error) {
+	progressScore := 0.0
 	intermediate := make(map[int][]KeyValue)
 
 	// keep track of files we need to pull from other workers
@@ -161,6 +220,8 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 	}
 
 	// get the files we require from the other workers
+	mapSize := float64(len(mapSet))
+	idx := 0.0
 	for workerId, loc := range mapSet {
 		intermediateArgs := IntermediateFileArgs{
 			ReduceID: reply.TaskID,
@@ -173,6 +234,12 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 				// update the data from the other worker
 				intermediate[mapId] = updateKVPairs(bytes.NewReader(fileBytes), intermediate[mapId])
 			}
+
+			// calculate the progress for this section and report it to the coordinator
+			idx += 1
+			progressScore = (idx / mapSize) * 0.33333
+			worker.sendStatusUpdate(progressScore, ReduceTask, reply.TaskID)
+			worker.straggle()
 		} else {
 			// if we failed to get the work, we need to tell the coordinator to recompute
 			// the work and then we wait and try to get all the data again later
@@ -188,8 +255,22 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 				// failed to reach the coordinator, ignore this and let the next reduce job report the error
 				// to the coordinator when it reaches the same issue
 			}
+
+			// hard abort this reduce task
+			return "", errors.New("Failed to get intermediate files")
 		}
 	}
+
+	// copy phase is complete, report 1/3 progress
+	progressScore = 0.3333333
+	worker.sendStatusUpdate(progressScore, ReduceTask, reply.TaskID)
+
+	// for the sake of simulating the sort phase, we will just say
+	// the coalescing between the different files is 1/3 of the work
+	// and the rest is 2/3 of the work. Since we are using sort.Slice
+	// instead of running the sort ourselves, we can't easily introspect
+	// the progress to provide periodic updates, so we will just report
+	// it wholesale at the end.
 
 	// coalesce the intermediate keys into a flat structure
 	var keyValues []KeyValue
@@ -197,10 +278,19 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 		keyValues = append(keyValues, data...)
 	}
 
+	progressScore = 0.3333333 + (0.3333333 * 0.33333333)
+	worker.sendStatusUpdate(progressScore, ReduceTask, reply.TaskID)
+	worker.straggle()
+
 	// Sort intermediate key-value pairs by key
 	sort.Slice(keyValues, func(i, j int) bool {
 		return keyValues[i].Key < keyValues[j].Key
 	})
+
+	// sort phase is complete, report 2/3 progress
+	progressScore = 0.666666666
+	worker.sendStatusUpdate(progressScore, ReduceTask, reply.TaskID)
+	worker.straggle()
 
 	// Create temporary output file
 	tmpFile, err := os.CreateTemp(".", fmt.Sprintf("mr-reduce-tmp-%d-*", reply.TaskID))
@@ -211,6 +301,9 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 	// Group identical keys and call Reduce on each group
 	i := 0
 	length := len(keyValues)
+	reportRate := 5000
+	reportCounter := 0
+	numResults := float64(length)
 	for i < length {
 		j := i + 1
 
@@ -222,6 +315,15 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 
 		output := reducef(keyValues[i].Key, values)
 
+		// report back to the coordinator for every reportRate intervals
+		reportCounter = (reportCounter + 1) % reportRate
+		if reportCounter == 0 {
+			// cap the max progress for this section to be 0.95 so the final renaming section takes
+			// the final 0.1 of the progress.
+			worker.sendStatusUpdate(progressScore+(float64(i)/numResults)*0.3333333, ReduceTask, reply.TaskID)
+			worker.straggle()
+		}
+
 		// Required output format: "%v %v\n"
 		fmt.Fprintf(tmpFile, "%v %v\n", keyValues[i].Key, output)
 
@@ -232,6 +334,10 @@ func (worker *WorkerState) handleReduce(reply WorkerReply, reducef func(string, 
 	if err := tmpFile.Close(); err != nil {
 		return "", err
 	}
+
+	// report the final status now that each phase is complete
+	progressScore = 1.0
+	worker.sendStatusUpdate(progressScore, ReduceTask, reply.TaskID)
 
 	finalName := fmt.Sprintf("mr-out-%d", reply.TaskID)
 	return finalName, os.Rename(tmpName, finalName)
@@ -273,6 +379,8 @@ func initializeWorkerState() *WorkerState {
 		}
 	}
 
+	log.Printf("Setup worker with address: %s:%d\nConnecting to coordinator: %s\nWith straggle rate: %d ms\n", ipAddress, servePort, coordinatorAddress, straggleRate)
+
 	worker := WorkerState{
 		mapIDs:             []int{},
 		servePort:          servePort,
@@ -290,7 +398,7 @@ func initializeWorkerState() *WorkerState {
 	reply := WorkerRegisterReply{}
 	if err := call("Coordinator.RegisterWorker", &args, &reply, worker.coordinatorAddress); err == nil {
 		worker.registered = true
-		worker.uuid = reply.Uuid
+		worker.uuid = reply.WorkerID
 		log.Printf("Registered with UUID: %s", worker.uuid)
 	} else {
 		log.Fatal("Failed to register worker with coordinator:", err)
@@ -313,8 +421,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		if worker.jobDone {
 			return
 		}
-		time.Sleep(time.Duration(worker.straggleRate) * time.Millisecond)
-		args := WorkerArgs{}
+		worker.straggle()
+		args := WorkerArgs{
+			WorkerID: worker.uuid,
+		}
 		reply := WorkerReply{}
 
 		if err := call("Coordinator.GetWork", &args, &reply, worker.coordinatorAddress); err != nil {
@@ -344,6 +454,10 @@ func Worker(mapf func(string, string) []KeyValue,
 						break
 					} else if strings.Contains(err.Error(), "connection refused") {
 						time.Sleep(1 * time.Second)
+						// we could have been terminated during this time
+						if worker.jobDone {
+							return
+						}
 					} else {
 						break
 					}
@@ -366,6 +480,10 @@ func Worker(mapf func(string, string) []KeyValue,
 							break
 						} else if strings.Contains(err.Error(), "connection refused") {
 							time.Sleep(1 * time.Second)
+							// we could have been terminated during this time
+							if worker.jobDone {
+								return
+							}
 						} else {
 							break
 						}
