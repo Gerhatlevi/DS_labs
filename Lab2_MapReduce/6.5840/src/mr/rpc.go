@@ -29,7 +29,14 @@ type WorkerRegisterArgs struct {
 }
 
 type WorkerRegisterReply struct {
-	Uuid string
+	WorkerID string
+}
+
+type StatusUpdateArgs struct {
+	WorkerID      string
+	TaskType      TaskType
+	TaskID        int
+	ProgressScore float64
 }
 
 type FileLocation struct {
@@ -38,11 +45,14 @@ type FileLocation struct {
 	Port     int
 }
 
+// FormatAddress is a string format function to make it easy for
+// consumers of FileLocation to get the proper string formatted address
 func (loc *FileLocation) FormatAddress() string {
 	return fmt.Sprintf("%s:%d", loc.Address, loc.Port)
 }
 
-// Worker send this to coordinator, if Worker is looking for a task this is empty, after completing values will be set
+// Worker send this to coordinator, if Worker is looking for a task this is empty,
+// after completing values will be set
 type WorkerArgs struct {
 	TaskType       TaskType
 	TaskID         int
